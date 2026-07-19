@@ -1,8 +1,29 @@
 const express = require('express');
+const crypto = require('crypto');
 const app = express();
-app.use(express.json());
+
+// Keep raw body for signature verification
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf.toString();
+  }
+}));
 
 const VERIFY_TOKEN = 'family-ai-verify-123';
+
+// Check every message actually came from Meta
+function verifyMetaSignature(req) {
+  const signature = req.headers['x-hub-signature-256'];
+  if (!signature) return false;
+  const expectedSignature = 'sha256=' + crypto
+    .createHmac('sha256', process.env.META_APP_SECRET)
+    .update(req.rawBody)
+    .digest('hex');
+  return crypto.timingSafeEqual(
+    Buffer.from(signature),
+    Buffer.from(expectedSignature)
+  );
+}
 
 // Webhook verification (Meta requires this)
 app.get('/webhook', (req, res) => {
@@ -18,6 +39,12 @@ app.get('/webhook', (req, res) => {
 
 // Receive messages
 app.post('/webhook', async (req, res) => {
+  // Reject anything not from Meta
+  if (!verifyMetaSignature(req)) {
+    console.log('Invalid signature - rejected');
+    return res.sendStatus(403);
+  }
+
   const body = req.body;
   if (body.object === 'whatsapp_business_account') {
     const entry = body.entry?.[0];
@@ -34,5 +61,5 @@ app.post('/webhook', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.start = app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 module.exports = app;

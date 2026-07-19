@@ -2,7 +2,6 @@ const express = require('express');
 const crypto = require('crypto');
 const app = express();
 
-// Keep raw body for signature verification
 app.use(express.json({
   verify: (req, res, buf) => {
     req.rawBody = buf.toString();
@@ -11,7 +10,6 @@ app.use(express.json({
 
 const VERIFY_TOKEN = 'family-ai-verify-123';
 
-// Check every message actually came from Meta
 function verifyMetaSignature(req) {
   const signature = req.headers['x-hub-signature-256'];
   if (!signature) return false;
@@ -25,41 +23,19 @@ function verifyMetaSignature(req) {
   );
 }
 
-// Webhook verification (Meta requires this)
-app.get('/webhook', (req, res) => {
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
-  const challenge = req.query['hub.challenge'];
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-    res.status(200).send(challenge);
-  } else {
-    res.sendStatus(403);
-  }
-});
-
-// Receive messages
-app.post('/webhook', async (req, res) => {
-  // Reject anything not from Meta
-  if (!verifyMetaSignature(req)) {
-    console.log('Invalid signature - rejected');
-    return res.sendStatus(403);
-  }
-
-  const body = req.body;
-  if (body.object === 'whatsapp_business_account') {
-    const entry = body.entry?.[0];
-    const changes = entry?.changes?.[0];
-    const message = changes?.value?.messages?.[0];
-    if (message) {
-      const from = message.from;
-      const text = message.text?.body;
-      console.log(`Message from ${from}: ${text}`);
-      // TODO: send to Claude and reply
-    }
-  }
-  res.sendStatus(200);
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-module.exports = app;
+async function askAI(message) {
+  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      model: 'llama3-8b-8192',
+      messages: [
+        {
+          role: 'system',
+          content: `You are a family assistant for Meytal. You help with:
+1. PLAYDATES: Check if kids are free and coordinate schedules
+2. CLASS CHANNELS: Filter WhatsApp messages, translate Hebrew to English, only flag what parents need to know (schedule changes, things to bring, deadlines, permission slips)
+3. STUDY

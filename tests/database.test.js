@@ -57,6 +57,7 @@ describe('Prisma schema foundation', () => {
       'MessageStatus',
       'TaskStatus',
       'TaskPriority',
+      'TaskSource',
       'CalendarProposalStatus',
       'ApprovalType',
       'ApprovalStatus',

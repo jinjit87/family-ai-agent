@@ -46,16 +46,26 @@ enum MessageStatus {
 }
 
 enum TaskStatus {
-  PENDING
+  OPEN
   IN_PROGRESS
-  DONE
-  CANCELLED
+  WAITING
+  COMPLETED
+  ARCHIVED
 }
 
 enum TaskPriority {
   LOW
   MEDIUM
   HIGH
+  URGENT
+}
+
+enum TaskSource {
+  MANUAL
+  EMAIL
+  WHATSAPP
+  CALENDAR
+  AI
 }
 
 enum CalendarProposalStatus {
@@ -124,6 +134,7 @@ model Conversation {
 
   contact  Contact   @relation(fields: [contactId], references: [id], onDelete: Cascade)
   messages Message[]
+  tasks    Task[]
 
   @@index([contactId])
   @@index([status])
@@ -149,22 +160,30 @@ model Message {
 }
 
 model Task {
-  id          String       @id @default(cuid())
-  createdAt   DateTime     @default(now())
-  updatedAt   DateTime     @updatedAt
-  title       String
-  description String?
-  status      TaskStatus   @default(PENDING)
-  priority    TaskPriority @default(MEDIUM)
-  dueAt       DateTime?
-  contactId   String?
+  id             String       @id @default(cuid())
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  title          String
+  description    String?
+  status         TaskStatus   @default(OPEN)
+  priority       TaskPriority @default(MEDIUM)
+  dueDate        DateTime?
+  completedAt    DateTime?
+  source         TaskSource   @default(MANUAL)
+  contactId      String?
+  conversationId String?
 
-  contact   Contact?   @relation(fields: [contactId], references: [id], onDelete: SetNull)
-  approvals Approval[]
+  contact      Contact?      @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  conversation Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  approvals    Approval[]
 
   @@index([status])
+  @@index([priority])
+  @@index([source])
   @@index([contactId])
-  @@index([dueAt])
+  @@index([conversationId])
+  @@index([dueDate])
+  @@index([updatedAt])
 }
 
 model CalendarProposal {

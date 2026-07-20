@@ -9,21 +9,29 @@ Family AI assistant for calendar-aware briefings (Anthropic + Google Calendar).
 - **Calendar:** Google Calendar API (read-only)
 - **Database:** PostgreSQL via Prisma (Phase 2 foundation)
 - **Contacts API:** CRUD over Prisma `Contact` (Phase 3)
+- **Tasks API:** task management over Prisma `Task` (Phase 4)
 - **Auth:** shared admin secret (`ADMIN_API_KEY`) for operational HTTP routes
 - **Hosting:** Railway-compatible (`Procfile`, `PORT`)
 
 ```
 HTTP
- ├── GET /health          public
- ├── GET /health/db       public → PostgreSQL connectivity
- ├── GET /auth            admin Bearer required → Google OAuth
- ├── GET /auth/callback   Google redirect (no tokens in response/logs)
- ├── GET /morning         admin Bearer required → AI briefing (JSON)
- ├── GET /contacts        admin Bearer required → list/search contacts
- ├── GET /contacts/:id    admin Bearer required → get contact
- ├── POST /contacts       admin Bearer required → create contact
- ├── PATCH /contacts/:id  admin Bearer required → update contact
- └── DELETE /contacts/:id admin Bearer required → soft-delete contact
+ ├── GET /health                 public
+ ├── GET /health/db              public → PostgreSQL connectivity
+ ├── GET /auth                   admin Bearer required → Google OAuth
+ ├── GET /auth/callback          Google redirect (no tokens in response/logs)
+ ├── GET /morning                admin Bearer required → AI briefing (JSON)
+ ├── GET /contacts               admin Bearer required → list/search contacts
+ ├── GET /contacts/:id           admin Bearer required → get contact
+ ├── POST /contacts              admin Bearer required → create contact
+ ├── PATCH /contacts/:id         admin Bearer required → update contact
+ ├── DELETE /contacts/:id        admin Bearer required → soft-delete contact
+ ├── GET /tasks                  admin Bearer required → list/search/filter tasks
+ ├── GET /tasks/:id              admin Bearer required → get task
+ ├── POST /tasks                 admin Bearer required → create task
+ ├── PATCH /tasks/:id            admin Bearer required → update task
+ ├── POST /tasks/:id/complete    admin Bearer required → complete task
+ ├── POST /tasks/:id/reopen      admin Bearer required → reopen task
+ └── POST /tasks/:id/archive     admin Bearer required → archive task
 ```
 
 ## WhatsApp status (disabled)
@@ -50,7 +58,7 @@ If a Google refresh token or admin key may have been exposed in older logs, rota
 - Node.js 18+
 - Google Cloud OAuth client (Calendar API enabled)
 - Anthropic API key
-- PostgreSQL (for Contacts API and `/health/db`)
+- PostgreSQL (for Contacts/Tasks APIs and `/health/db`)
 
 ### Install
 
@@ -72,7 +80,7 @@ Create a local `.env` file (never commit it), or export variables in your shell.
 | `GOOGLE_REFRESH_TOKEN` | no | Offline refresh token for Calendar access |
 | `PORT` | no | Listen port (default `3000`) |
 | `MY_WHATSAPP` | no | Reserved; unused while WhatsApp is disabled |
-| `DATABASE_URL` | no* | PostgreSQL connection string (`postgresql://...`). Optional for app startup; required for migrations, seeds, Contacts API, and `/health/db` to report healthy |
+| `DATABASE_URL` | no* | PostgreSQL connection string (`postgresql://...`). Optional for app startup; required for migrations, seeds, Contacts/Tasks APIs, and `/health/db` to report healthy |
 
 ### Run
 
@@ -98,10 +106,11 @@ export DATABASE_URL="postgresql://USER:PASSWORD@localhost:5432/family_ai_agent?s
 npm test
 ```
 
-Contacts module coverage (target >95%):
+Contacts and Tasks module coverage (target >95%):
 
 ```bash
 npm run test:coverage
+npm run test:coverage:tasks
 ```
 
 ## Database (Phase 2 foundation)
@@ -276,6 +285,127 @@ curl -X DELETE -H "Authorization: Bearer $ADMIN_API_KEY" \
 
 Sets `deletedAt` and returns the contact. The row remains in PostgreSQL. A second delete returns `404`.
 
+## Tasks API (Phase 4)
+
+Admin-authenticated task management for the Prisma `Task` model. Completing sets `completedAt`; reopening clears it. Archived tasks are excluded from list results unless `includeArchived=true`.
+
+All routes require:
+
+```http
+Authorization: Bearer <ADMIN_API_KEY>
+```
+
+### Lifecycle invariants (`completedAt`)
+
+| Transition | `completedAt` behavior |
+|------------|------------------------|
+| Status becomes `COMPLETED` (create, patch, or `POST .../complete`) | Set (or preserved if already completed) |
+| Task is reopened (`POST .../reopen`, or patch to `OPEN` / `IN_PROGRESS` / `WAITING`) | Cleared to `null` |
+| Task is archived (`POST .../archive`, or patch to `ARCHIVED`) | **Preserved** — historical completion time is kept intentionally |
+
+Invalid bodies/queries return `400` with `{ error: "Validation failed", details: [...] }` (Zod). Invalid `contactId` / `conversationId` foreign keys return `400` with a safe message (no Prisma details). Missing tasks return `404`. Unauthenticated requests return `401`.
+
+### Fields
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | string (cuid) | read-only |
+| `title` | string | required on create |
+| `description` | string \| null | optional |
+| `priority` | enum | `LOW` \| `MEDIUM` \| `HIGH` \| `URGENT` (default `MEDIUM`) |
+| `status` | enum | `OPEN` \| `IN_PROGRESS` \| `WAITING` \| `COMPLETED` \| `ARCHIVED` (default `OPEN`) |
+| `dueDate` | ISO datetime \| null | optional |
+| `completedAt` | ISO datetime \| null | see lifecycle invariants above |
+| `source` | enum | `MANUAL` \| `EMAIL` \| `WHATSAPP` \| `CALENDAR` \| `AI` (default `MANUAL`) |
+| `contactId` | string \| null | optional FK to `Contact` |
+| `conversationId` | string \| null | optional FK to `Conversation` |
+| `createdAt` / `updatedAt` | ISO datetime | read-only |
+
+### List / search / filter / sort / pagination
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_API_KEY" \
+  "https://YOUR_HOST/tasks?q=school&status=OPEN&priority=HIGH&source=EMAIL&contactId=...&page=1&limit=20&sort=dueDate&includeArchived=false"
+```
+
+Query params:
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `q` | — | Case-insensitive search across **title** and **description** |
+| `status` | — | Filter by status enum |
+| `priority` | — | Filter by priority enum |
+| `source` | — | Filter by source enum |
+| `contactId` | — | Filter by related contact id |
+| `includeArchived` | `false` | When `false`, `ARCHIVED` tasks never appear (even if `status=ARCHIVED`) |
+| `page` | `1` | 1-based page index |
+| `limit` | `20` | Page size (max `100`) |
+| `sort` | `updatedAt` | `dueDate` (asc, nulls last), `priority` (desc: URGENT first), or `updatedAt` (desc) |
+
+Response shape:
+
+```json
+{
+  "data": [ /* task objects */ ],
+  "pagination": { "page": 1, "limit": 20, "total": 3, "totalPages": 1 }
+}
+```
+
+### Create
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Buy school supplies","priority":"HIGH","source":"MANUAL","dueDate":"2026-08-01T12:00:00.000Z"}' \
+  https://YOUR_HOST/tasks
+```
+
+Returns `201` with the created task. Creating with `status: "COMPLETED"` sets `completedAt`.
+
+### Get by id
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_API_KEY" https://YOUR_HOST/tasks/:id
+```
+
+### Update (partial)
+
+```bash
+curl -X PATCH -H "Authorization: Bearer $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"status":"IN_PROGRESS","priority":"URGENT"}' \
+  https://YOUR_HOST/tasks/:id
+```
+
+Patching `status` to `COMPLETED` sets `completedAt`. Patching to `OPEN` / `IN_PROGRESS` / `WAITING` clears `completedAt`. Patching to `ARCHIVED` preserves any existing `completedAt`.
+
+### Complete
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
+  https://YOUR_HOST/tasks/:id/complete
+```
+
+Sets `status` to `COMPLETED` and sets `completedAt` (preserves existing `completedAt` if already completed).
+
+### Reopen
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
+  https://YOUR_HOST/tasks/:id/reopen
+```
+
+Sets `status` to `OPEN` and clears `completedAt`.
+
+### Archive
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
+  https://YOUR_HOST/tasks/:id/archive
+```
+
+Sets `status` to `ARCHIVED` and **preserves** `completedAt` when the task was previously completed (historical completion time is intentional). Archived tasks are hidden from `GET /tasks` unless `includeArchived=true`.
+
 ## Railway environment variables
 
 Set the same variables in the Railway project:
@@ -287,7 +417,7 @@ Set the same variables in the Railway project:
 - `ADMIN_API_KEY` — long random secret
 - `GOOGLE_REFRESH_TOKEN` — after completing `/auth` once
 - `PORT` — usually injected by Railway
-- `DATABASE_URL` — from the Railway PostgreSQL plugin (required for DB features and Contacts API)
+- `DATABASE_URL` — from the Railway PostgreSQL plugin (required for DB features and Contacts/Tasks APIs)
 
 Also add the same redirect URI in Google Cloud Console → OAuth client → Authorized redirect URIs.
 
@@ -326,6 +456,10 @@ Follow the redirect in a browser session that can complete Google consent. After
 
 See [Contacts API (Phase 3)](#contacts-api-phase-3) above.
 
+### Tasks (protected)
+
+See [Tasks API (Phase 4)](#tasks-api-phase-4) above.
+
 ## Google OAuth scopes
 
 Only:
@@ -344,3 +478,4 @@ Gmail scopes are not requested.
 6. Run `npx prisma migrate deploy` (or `npm run db:migrate`) so Postgres matches the schema, then optionally `npm run db:seed`.
 7. Confirm `/health/db` returns `"database":"up"`.
 8. Confirm Contacts CRUD works with a Bearer token (list/create/get/patch/soft-delete).
+9. Confirm Tasks API works with a Bearer token (list/create/get/patch/complete/reopen/archive).

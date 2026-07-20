@@ -214,7 +214,13 @@ function createApp(env) {
   });
 
   // Phase 3: Contacts CRUD (additive — does not alter existing endpoints).
+  // Must be registered before the final catch-all 404 handler.
   app.use('/contacts', createContactsRouter({ adminAuth }));
+
+  // Final catch-all — must remain the last route/middleware.
+  app.use((_req, res) => {
+    res.status(404).json({ error: 'Not found' });
+  });
 
   return app;
 }

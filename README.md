@@ -108,7 +108,7 @@ npm run test:coverage
 
 Prisma models: `Contact`, `Conversation`, `Message`, `Task`, `CalendarProposal`, `Approval`, `Rule`, `AuditLog`.
 
-This phase adds the schema, migrations, seed data, and a DB health check. Existing HTTP endpoints from Phase 1 are unchanged. WhatsApp is not integrated yet.
+Phase 2 added the schema, migrations, seed data, and `GET /health/db`. The Contacts HTTP API is Phase 3 (below). WhatsApp is not integrated.
 
 ### Local database
 

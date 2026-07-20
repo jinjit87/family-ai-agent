@@ -107,7 +107,6 @@ model Contact {
 
   @@index([phone])
   @@index([email])
-  @@index([company])
   @@index([deletedAt])
   @@index([name])
   @@index([updatedAt])

@@ -219,6 +219,23 @@ describe('Contacts API', () => {
     await request(app).delete('/contacts/some-id').expect(401);
   });
 
+  it('mounts /contacts before the final catch-all 404 handler', async () => {
+    // a) Unauthenticated /contacts must hit admin auth (401), not the catch-all (404).
+    const unauth = await request(app).get('/contacts').expect(401);
+    assert.equal(unauth.body.error, 'Unauthorized');
+    assert.notEqual(unauth.status, 404);
+
+    // b) Authenticated /contacts reaches the Contacts router (list payload).
+    const authed = await auth(request(app).get('/contacts')).expect(200);
+    assert.ok(Array.isArray(authed.body.data));
+    assert.equal(typeof authed.body.pagination, 'object');
+    assert.equal(typeof authed.body.pagination.page, 'number');
+
+    // c) Unknown routes still hit the final catch-all 404.
+    const missing = await request(app).get('/definitely-not-a-real-route').expect(404);
+    assert.equal(missing.body.error, 'Not found');
+  });
+
   it('POST /contacts creates a contact', async () => {
     const res = await auth(request(app).post('/contacts'))
       .send({

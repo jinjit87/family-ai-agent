@@ -658,16 +658,31 @@ AI analysis **never** auto-creates Tasks or Payments.
 1. `POST /inbox/:id/analyze` runs the mock analysis provider and persists `InboxTaskSuggestion` / `InboxPaymentSuggestion` / `InboxReplySuggestion` rows as `PENDING`.
 2. `POST .../approve` → `APPROVED` (idempotent if already approved).
 3. `POST .../reject` → `REJECTED` (cannot reject `APPLIED`).
-4. `POST .../apply` creates a Task or Payment **only after approval**, links it back via `appliedTaskId` / `appliedPaymentId` and `Task.inboxItemId` / `Payment.inboxItemId`, and sets status `APPLIED`. Re-applying is **idempotent** and returns the same entity.
+4. `POST .../apply` creates a Task or Payment **only after approval**, links it back via `appliedTaskId` / `appliedPaymentId` and `Task.inboxItemId` / `Payment.inboxItemId`, and sets status `APPLIED`. Apply uses a DB row lock (`SELECT FOR UPDATE`) so concurrent requests create at most one entity and remain **idempotent**.
 
-Reply suggestions have no outbound send yet — `apply` only marks them `APPLIED` after approval.
+Reply suggestions have no outbound send yet — `apply` only marks them `APPLIED` after approval (also concurrency-safe).
+
+### Repeated analysis
+
+`POST /inbox/:id/analyze` may be called more than once. Chosen rule:
+
+- Re-analysis **atomically replaces** non-applied suggestions (`PENDING`, `APPROVED`, `REJECTED`).
+- **Never** deletes or overwrites `APPLIED` suggestions or their Task/Payment provenance.
+- Accidental retries therefore do **not** duplicate pending suggestions.
+- If analysis fails mid-flight, the write transaction rolls back (no partial new suggestion set) and the item is set to `FAILED` — it is never left stuck in `PROCESSING`.
+
+### Inactive accounts
+
+- `POST .../deactivate` is **non-destructive**: it flips `isActive=false` only. Items and suggestions are not deleted (there is no account DELETE endpoint).
+- Inactive accounts **reject new ingestion** (`POST /inbox` → `409 Inbox account is inactive`), including future provider-style sync. Existing items remain readable.
 
 ### Security rules
 
 - Admin Bearer auth on every `/inbox` route.
 - Zod validation on bodies, query params, and ids.
 - List endpoints **omit `rawContent`** by default; detail (`GET /inbox/:id`) includes it.
-- Responses never expose OAuth tokens, credentials, database/Prisma details, or raw provider errors.
+- Suggestion routes require `suggestionId` to belong to the inbox item in the URL; task/payment/reply suggestion types cannot be mixed across endpoints (`404`).
+- Responses and logs never expose OAuth tokens, credentials, `DATABASE_URL`, SQL, Prisma codes, raw provider errors, or `rawContent` on list responses.
 - Mock analysis returns concise user-facing reasons only (no chain-of-thought). Anthropic is not called from the inbox analyzer yet.
 
 ### Inbox accounts

@@ -1234,6 +1234,443 @@ describe('Inbox API', () => {
   });
 });
 
+describe('Inbox concurrency, re-analysis, safety, and route order', () => {
+  let app;
+  let prisma;
+
+  before(async () => {
+    process.env.DATABASE_URL = DATABASE_URL;
+    const env = loadEnv(VALID_ENV);
+    app = createApp(env);
+    prisma = getPrisma();
+    await prisma.$queryRaw`SELECT 1`;
+  });
+
+  after(async () => {
+    await cleanup();
+    await disconnectPrisma();
+  });
+
+  async function cleanup() {
+    await prisma.inboxReplySuggestion.deleteMany({
+      where: { inboxItem: { subject: { startsWith: '[test-inbox-safe]' } } },
+    });
+    await prisma.inboxPaymentSuggestion.deleteMany({
+      where: { inboxItem: { subject: { startsWith: '[test-inbox-safe]' } } },
+    });
+    await prisma.inboxTaskSuggestion.deleteMany({
+      where: { inboxItem: { subject: { startsWith: '[test-inbox-safe]' } } },
+    });
+    await prisma.task.deleteMany({
+      where: {
+        OR: [
+          { title: { startsWith: '[test-inbox-safe]' } },
+          { inboxItem: { subject: { startsWith: '[test-inbox-safe]' } } },
+        ],
+      },
+    });
+    await prisma.payment.deleteMany({
+      where: {
+        OR: [
+          { payeeName: { startsWith: '[test-inbox-safe]' } },
+          { inboxItem: { subject: { startsWith: '[test-inbox-safe]' } } },
+        ],
+      },
+    });
+    await prisma.inboxItem.deleteMany({
+      where: {
+        OR: [
+          { subject: { startsWith: '[test-inbox-safe]' } },
+          { externalId: { startsWith: 'test-inbox-safe-' } },
+        ],
+      },
+    });
+    await prisma.inboxAccount.deleteMany({
+      where: { name: { startsWith: '[test-inbox-safe]' } },
+    });
+  }
+
+  beforeEach(async () => {
+    await cleanup();
+    inbox.resetAnalysisProvider();
+  });
+
+  afterEach(async () => {
+    await cleanup();
+    inbox.resetAnalysisProvider();
+  });
+
+  async function createAccount(overrides = {}) {
+    const res = await auth(request(app).post('/inbox/accounts'))
+      .send({
+        name: overrides.name || '[test-inbox-safe] Acc',
+        source: overrides.source || 'GMAIL',
+        emailAddress: overrides.emailAddress || `safe-${Date.now()}@inbox-test.example`,
+        isActive: overrides.isActive,
+      })
+      .expect(201);
+    return res.body;
+  }
+
+  async function createItem(accountId, overrides = {}) {
+    const res = await auth(request(app).post('/inbox'))
+      .send({
+        inboxAccountId: accountId,
+        externalId: overrides.externalId || `test-inbox-safe-${Date.now()}-${Math.random()}`,
+        senderIdentifier: overrides.senderIdentifier || `safe-${Date.now()}@inbox-test.example`,
+        subject: overrides.subject || '[test-inbox-safe] Subject',
+        rawContent: overrides.rawContent || 'Please pay ILS 50.00 due 2026-08-01 and confirm?',
+        receivedAt: overrides.receivedAt || '2026-07-20T10:00:00.000Z',
+      })
+      .expect(201);
+    return res.body;
+  }
+
+  it('createApp middleware order: auth before catch-all; /accounts not captured as :id', async () => {
+    const unauth = await request(app).get('/inbox');
+    assert.equal(unauth.status, 401);
+    assert.notEqual(unauth.status, 404);
+
+    const listed = await auth(request(app).get('/inbox')).expect(200);
+    assert.ok(Array.isArray(listed.body.data));
+    assert.ok(listed.body.pagination);
+
+    const accounts = await auth(request(app).get('/inbox/accounts')).expect(200);
+    assert.ok(Array.isArray(accounts.body.data));
+    // Must not be treated as GET /inbox/:id ("accounts" as id → 404 item)
+    assert.equal(accounts.body.error, undefined);
+
+    const account = await createAccount({ name: '[test-inbox-safe] Route Acc' });
+    const item = await createItem(account.id, { subject: '[test-inbox-safe] Analyze route' });
+    const analyzed = await auth(request(app).post(`/inbox/${item.id}/analyze`)).expect(200);
+    assert.equal(analyzed.body.item.status, 'READY_FOR_REVIEW');
+    assert.ok(analyzed.body.analysis);
+
+    const missing = await request(app).get('/no-such-route-inbox-order').expect(404);
+    assert.equal(missing.body.error, 'Not found');
+  });
+
+  it('deactivating an account is non-destructive and rejects new ingestion', async () => {
+    const account = await createAccount({ name: '[test-inbox-safe] Deactivate Acc' });
+    const existing = await createItem(account.id, { subject: '[test-inbox-safe] Keep me' });
+
+    const deactivated = await auth(request(app).post(`/inbox/accounts/${account.id}/deactivate`)).expect(
+      200
+    );
+    assert.equal(deactivated.body.isActive, false);
+
+    // Existing item still readable; account row still present (no destructive delete).
+    const stillThere = await auth(request(app).get(`/inbox/${existing.id}`)).expect(200);
+    assert.equal(stillThere.body.id, existing.id);
+    const accountStill = await auth(request(app).get(`/inbox/accounts/${account.id}`)).expect(200);
+    assert.equal(accountStill.body.id, account.id);
+    assert.equal(accountStill.body.isActive, false);
+
+    // No DELETE /inbox/accounts/:id route — falls through to item :id handler → 404 item.
+    const deleteAttempt = await auth(request(app).delete(`/inbox/accounts/${account.id}`));
+    assert.ok([404, 401].includes(deleteAttempt.status) || deleteAttempt.status >= 400);
+
+    const rejected = await auth(request(app).post('/inbox')).send({
+      inboxAccountId: account.id,
+      externalId: `test-inbox-safe-inactive-${Date.now()}`,
+      senderIdentifier: 'inactive@inbox-test.example',
+      subject: '[test-inbox-safe] Should reject',
+      rawContent: 'nope',
+      receivedAt: '2026-07-20T10:00:00.000Z',
+    });
+    assert.equal(rejected.status, 409);
+    assert.equal(rejected.body.error, 'Inbox account is inactive');
+    assert.equal(JSON.stringify(rejected.body).includes('Prisma'), false);
+  });
+
+  it('enforces account isolation, suggestion ownership, and type separation', async () => {
+    const a = await createAccount({ name: '[test-inbox-safe] Iso A' });
+    const b = await createAccount({ name: '[test-inbox-safe] Iso B' });
+    const sharedExt = `test-inbox-safe-shared-${Date.now()}`;
+
+    const itemA = await createItem(a.id, {
+      externalId: sharedExt,
+      subject: '[test-inbox-safe] A item',
+      rawContent: 'Please schedule pickup and pay ILS 10.00 due 2026-08-01?',
+    });
+    const itemB = await createItem(b.id, {
+      externalId: sharedExt,
+      subject: '[test-inbox-safe] B item',
+    });
+    assert.equal(itemA.externalId, itemB.externalId);
+    assert.notEqual(itemA.id, itemB.id);
+
+    const dup = await auth(request(app).post('/inbox')).send({
+      inboxAccountId: a.id,
+      externalId: sharedExt,
+      senderIdentifier: 'dup@inbox-test.example',
+      subject: '[test-inbox-safe] Dup',
+      rawContent: 'dup',
+      receivedAt: '2026-07-20T11:00:00.000Z',
+    });
+    assert.equal(dup.status, 409);
+    assert.equal(JSON.stringify(dup.body).includes('P2002'), false);
+    assert.equal(JSON.stringify(dup.body).includes('DATABASE_URL'), false);
+
+    const listA = await auth(request(app).get(`/inbox?inboxAccountId=${a.id}`)).expect(200);
+    assert.ok(listA.body.data.every((row) => row.inboxAccountId === a.id));
+    assert.equal(
+      listA.body.data.every((row) => !Object.prototype.hasOwnProperty.call(row, 'rawContent')),
+      true
+    );
+
+    const analyzed = await auth(request(app).post(`/inbox/${itemA.id}/analyze`)).expect(200);
+    const taskSug = analyzed.body.item.taskSuggestions[0];
+    const paySug = analyzed.body.item.paymentSuggestions[0];
+    const replySug = analyzed.body.item.replySuggestions[0];
+
+    // suggestionId must belong to the item in the URL
+    await auth(
+      request(app).post(`/inbox/${itemB.id}/task-suggestions/${taskSug.id}/approve`)
+    ).expect(404);
+
+    // Cannot mix suggestion types across endpoints
+    await auth(
+      request(app).post(`/inbox/${itemA.id}/payment-suggestions/${taskSug.id}/approve`)
+    ).expect(404);
+    await auth(
+      request(app).post(`/inbox/${itemA.id}/task-suggestions/${paySug.id}/approve`)
+    ).expect(404);
+    await auth(
+      request(app).post(`/inbox/${itemA.id}/reply-suggestions/${taskSug.id}/approve`)
+    ).expect(404);
+    assert.ok(replySug);
+  });
+
+  it('applies task/payment suggestions concurrently with at most one entity each', async () => {
+    const account = await createAccount({ name: '[test-inbox-safe] Concurrent Acc' });
+    const item = await createItem(account.id, {
+      subject: '[test-inbox-safe] Concurrent apply please pay ILS 75.00 due 2026-09-01',
+      rawContent: 'Please schedule this and pay ILS 75.00 due 2026-09-01?',
+    });
+    const analyzed = await auth(request(app).post(`/inbox/${item.id}/analyze`)).expect(200);
+    const taskSug = analyzed.body.item.taskSuggestions[0];
+    const paySug = analyzed.body.item.paymentSuggestions[0];
+    const replySug = analyzed.body.item.replySuggestions[0];
+    assert.ok(taskSug && paySug && replySug);
+
+    await auth(request(app).post(`/inbox/${item.id}/task-suggestions/${taskSug.id}/approve`)).expect(
+      200
+    );
+    await auth(
+      request(app).post(`/inbox/${item.id}/payment-suggestions/${paySug.id}/approve`)
+    ).expect(200);
+    await auth(
+      request(app).post(`/inbox/${item.id}/reply-suggestions/${replySug.id}/approve`)
+    ).expect(200);
+
+    const [t1, t2, t3] = await Promise.all([
+      auth(request(app).post(`/inbox/${item.id}/task-suggestions/${taskSug.id}/apply`)),
+      auth(request(app).post(`/inbox/${item.id}/task-suggestions/${taskSug.id}/apply`)),
+      auth(request(app).post(`/inbox/${item.id}/task-suggestions/${taskSug.id}/apply`)),
+    ]);
+    for (const res of [t1, t2, t3]) {
+      assert.ok([200, 409].includes(res.status), `unexpected status ${res.status}`);
+      assert.equal(JSON.stringify(res.body).includes('Prisma'), false);
+      assert.equal(JSON.stringify(res.body).includes('P20'), false);
+    }
+    const taskBodies = [t1, t2, t3].filter((r) => r.status === 200);
+    assert.ok(taskBodies.length >= 1);
+    const taskIds = new Set(taskBodies.map((r) => r.body.task.id));
+    assert.equal(taskIds.size, 1);
+    const taskCount = await prisma.task.count({
+      where: { inboxItemId: item.id, source: 'AI' },
+    });
+    assert.equal(taskCount, 1);
+    const taskSugRow = await prisma.inboxTaskSuggestion.findUnique({ where: { id: taskSug.id } });
+    assert.equal(taskSugRow.status, 'APPLIED');
+    assert.equal(taskSugRow.appliedTaskId, [...taskIds][0]);
+
+    const again = await auth(
+      request(app).post(`/inbox/${item.id}/task-suggestions/${taskSug.id}/apply`)
+    ).expect(200);
+    assert.equal(again.body.idempotent, true);
+    assert.equal(again.body.task.id, [...taskIds][0]);
+
+    const [p1, p2, p3] = await Promise.all([
+      auth(request(app).post(`/inbox/${item.id}/payment-suggestions/${paySug.id}/apply`)),
+      auth(request(app).post(`/inbox/${item.id}/payment-suggestions/${paySug.id}/apply`)),
+      auth(request(app).post(`/inbox/${item.id}/payment-suggestions/${paySug.id}/apply`)),
+    ]);
+    for (const res of [p1, p2, p3]) {
+      assert.ok([200, 409].includes(res.status));
+      assert.equal(JSON.stringify(res.body).includes('Prisma'), false);
+    }
+    const payBodies = [p1, p2, p3].filter((r) => r.status === 200);
+    assert.ok(payBodies.length >= 1);
+    const paymentIds = new Set(payBodies.map((r) => r.body.payment.id));
+    assert.equal(paymentIds.size, 1);
+    const paymentCount = await prisma.payment.count({
+      where: { inboxItemId: item.id, source: 'AI' },
+    });
+    assert.equal(paymentCount, 1);
+
+    const [r1, r2] = await Promise.all([
+      auth(request(app).post(`/inbox/${item.id}/reply-suggestions/${replySug.id}/apply`)),
+      auth(request(app).post(`/inbox/${item.id}/reply-suggestions/${replySug.id}/apply`)),
+    ]);
+    assert.ok([200, 409].includes(r1.status));
+    assert.ok([200, 409].includes(r2.status));
+    const replyRow = await prisma.inboxReplySuggestion.findUnique({ where: { id: replySug.id } });
+    assert.equal(replyRow.status, 'APPLIED');
+  });
+
+  it('repeated analysis replaces non-applied suggestions and preserves APPLIED', async () => {
+    const account = await createAccount({ name: '[test-inbox-safe] Reanalyze Acc' });
+    const item = await createItem(account.id, {
+      subject: '[test-inbox-safe] Reanalyze please pay ILS 20.00 due 2026-08-15',
+      rawContent: 'Please pay ILS 20.00 due 2026-08-15 and reply?',
+    });
+
+    const first = await auth(request(app).post(`/inbox/${item.id}/analyze`)).expect(200);
+    const firstTaskIds = first.body.item.taskSuggestions.map((s) => s.id).sort();
+    const firstPendingCount =
+      first.body.item.taskSuggestions.length +
+      first.body.item.paymentSuggestions.length +
+      first.body.item.replySuggestions.length;
+    assert.ok(firstPendingCount >= 1);
+
+    // Accidental repeated analysis — replaces pending, no duplicates of prior pending ids
+    const second = await auth(request(app).post(`/inbox/${item.id}/analyze`)).expect(200);
+    const secondTaskIds = second.body.item.taskSuggestions.map((s) => s.id).sort();
+    assert.notDeepEqual(secondTaskIds, firstTaskIds);
+    assert.ok(second.body.item.taskSuggestions.every((s) => s.status === 'PENDING'));
+
+    // Apply one task suggestion, then re-analyze — APPLIED preserved
+    const toApply = second.body.item.taskSuggestions[0];
+    await auth(request(app).post(`/inbox/${item.id}/task-suggestions/${toApply.id}/approve`)).expect(
+      200
+    );
+    const applied = await auth(
+      request(app).post(`/inbox/${item.id}/task-suggestions/${toApply.id}/apply`)
+    ).expect(200);
+    assert.equal(applied.body.suggestion.status, 'APPLIED');
+
+    const third = await auth(request(app).post(`/inbox/${item.id}/analyze`)).expect(200);
+    const appliedStill = third.body.item.taskSuggestions.filter((s) => s.status === 'APPLIED');
+    assert.equal(appliedStill.length, 1);
+    assert.equal(appliedStill[0].id, toApply.id);
+    assert.equal(appliedStill[0].appliedTaskId, applied.body.task.id);
+    assert.ok(third.body.item.taskSuggestions.some((s) => s.status === 'PENDING'));
+  });
+
+  it('analysis failure rolls back suggestion writes and does not stay PROCESSING', async () => {
+    const account = await createAccount({ name: '[test-inbox-safe] Fail Tx Acc' });
+    const item = await createItem(account.id, {
+      subject: '[test-inbox-safe] Fail tx',
+      rawContent: 'Please confirm?',
+    });
+
+    // Seed pending suggestions via successful analysis first
+    await auth(request(app).post(`/inbox/${item.id}/analyze`)).expect(200);
+    const beforeTasks = await prisma.inboxTaskSuggestion.count({ where: { inboxItemId: item.id } });
+    const beforePays = await prisma.inboxPaymentSuggestion.count({ where: { inboxItemId: item.id } });
+    const beforeReplies = await prisma.inboxReplySuggestion.count({
+      where: { inboxItemId: item.id },
+    });
+    assert.ok(beforeTasks + beforePays + beforeReplies > 0);
+
+    const originalTx = prisma.$transaction.bind(prisma);
+    prisma.$transaction = async () => {
+      throw new Error('simulated mid-analysis failure with SELECT * FROM secret');
+    };
+    try {
+      const failed = await auth(request(app).post(`/inbox/${item.id}/analyze`)).expect(500);
+      assert.equal(failed.body.error, 'Failed to analyze inbox item');
+      assert.equal(JSON.stringify(failed.body).includes('SELECT'), false);
+      assert.equal(JSON.stringify(failed.body).includes('secret'), false);
+      assert.equal(JSON.stringify(failed.body).includes('Prisma'), false);
+    } finally {
+      prisma.$transaction = originalTx;
+    }
+
+    const detail = await auth(request(app).get(`/inbox/${item.id}`)).expect(200);
+    assert.equal(detail.body.status, 'FAILED');
+    assert.notEqual(detail.body.status, 'PROCESSING');
+
+    // Prior suggestions unchanged (transaction never applied deletes/creates)
+    assert.equal(
+      await prisma.inboxTaskSuggestion.count({ where: { inboxItemId: item.id } }),
+      beforeTasks
+    );
+    assert.equal(
+      await prisma.inboxPaymentSuggestion.count({ where: { inboxItemId: item.id } }),
+      beforePays
+    );
+    assert.equal(
+      await prisma.inboxReplySuggestion.count({ where: { inboxItemId: item.id } }),
+      beforeReplies
+    );
+  });
+
+  it('responses omit secrets and list omits rawContent', async () => {
+    const account = await createAccount({ name: '[test-inbox-safe] Secret Acc' });
+    const item = await createItem(account.id, {
+      subject: '[test-inbox-safe] Secret body',
+      rawContent: 'TOP-SECRET-RAW-BODY oauth_token=xyz DATABASE_URL=postgres://',
+    });
+    const listed = await auth(request(app).get('/inbox?q=Secret%20body')).expect(200);
+    const row = listed.body.data.find((d) => d.id === item.id);
+    assert.ok(row);
+    assert.equal(Object.prototype.hasOwnProperty.call(row, 'rawContent'), false);
+    assert.equal(JSON.stringify(listed.body).includes('TOP-SECRET-RAW-BODY'), false);
+    assert.equal(JSON.stringify(listed.body).includes('oauth_token'), false);
+    assert.equal(JSON.stringify(account).includes('refresh_token'), false);
+  });
+
+  it('apply failures return safe conflict without Prisma details', async () => {
+    const account = await createAccount({ name: '[test-inbox-safe] Apply Fail Acc' });
+    const item = await createItem(account.id, {
+      subject: '[test-inbox-safe] Apply fail please pay ILS 5.00 due 2026-08-20',
+      rawContent: 'Please pay ILS 5.00 due 2026-08-20?',
+    });
+    const analyzed = await auth(request(app).post(`/inbox/${item.id}/analyze`)).expect(200);
+    const taskSug = analyzed.body.item.taskSuggestions[0];
+    const paySug = analyzed.body.item.paymentSuggestions[0];
+    const replySug = analyzed.body.item.replySuggestions[0];
+    await auth(request(app).post(`/inbox/${item.id}/task-suggestions/${taskSug.id}/approve`)).expect(
+      200
+    );
+    await auth(
+      request(app).post(`/inbox/${item.id}/payment-suggestions/${paySug.id}/approve`)
+    ).expect(200);
+    await auth(
+      request(app).post(`/inbox/${item.id}/reply-suggestions/${replySug.id}/approve`)
+    ).expect(200);
+
+    const originalTx = prisma.$transaction.bind(prisma);
+    prisma.$transaction = async () => {
+      throw new Error('PrismaClientKnownRequestError P2002 unique');
+    };
+    try {
+      const taskFail = await auth(
+        request(app).post(`/inbox/${item.id}/task-suggestions/${taskSug.id}/apply`)
+      ).expect(409);
+      assert.equal(taskFail.body.error, 'Failed to apply task suggestion');
+      assert.equal(JSON.stringify(taskFail.body).includes('P2002'), false);
+      assert.equal(JSON.stringify(taskFail.body).includes('Prisma'), false);
+
+      const payFail = await auth(
+        request(app).post(`/inbox/${item.id}/payment-suggestions/${paySug.id}/apply`)
+      ).expect(409);
+      assert.equal(payFail.body.error, 'Failed to apply payment suggestion');
+      assert.equal(JSON.stringify(payFail.body).includes('P2002'), false);
+
+      const replyFail = await auth(
+        request(app).post(`/inbox/${item.id}/reply-suggestions/${replySug.id}/apply`)
+      ).expect(409);
+      assert.equal(replyFail.body.error, 'Failed to apply reply suggestion');
+    } finally {
+      prisma.$transaction = originalTx;
+    }
+  });
+});
+
 describe('Inbox API error paths', () => {
   let app;
   const originals = {};

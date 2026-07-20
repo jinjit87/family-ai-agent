@@ -5,6 +5,7 @@ const { checkDatabaseHealth } = require('./lib/db');
 const { createContactsRouter } = require('./lib/contactsRouter');
 const { createTasksRouter } = require('./lib/tasksRouter');
 const { createPaymentsRouter } = require('./lib/paymentsRouter');
+const { createInboxRouter } = require('./lib/inboxRouter');
 
 const SERVICE_NAME = 'family-ai-agent';
 const CALENDAR_READONLY_SCOPE = 'https://www.googleapis.com/auth/calendar.readonly';
@@ -224,6 +225,9 @@ function createApp(env) {
 
   // Phase 5: Payments Due Engine (additive — does not alter existing endpoints).
   app.use('/payments', createPaymentsRouter({ adminAuth }));
+
+  // Phase 6: Multi-Inbox AI Inbox (additive — does not alter existing endpoints).
+  app.use('/inbox', createInboxRouter({ adminAuth }));
 
   // Final catch-all — must remain the last route/middleware.
   app.use((_req, res) => {

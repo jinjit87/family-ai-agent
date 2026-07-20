@@ -11,6 +11,7 @@ Family AI assistant for calendar-aware briefings (Anthropic + Google Calendar).
 - **Contacts API:** CRUD over Prisma `Contact` (Phase 3)
 - **Tasks API:** task management over Prisma `Task` (Phase 4)
 - **Payments API:** payments due engine over Prisma `Payment` (Phase 5)
+- **Inbox API:** multi-account AI inbox pipeline over Prisma `InboxAccount` / `InboxItem` (Phase 6)
 - **Auth:** shared admin secret (`ADMIN_API_KEY`) for operational HTTP routes
 - **Hosting:** Railway-compatible (`Procfile`, `PORT`)
 
@@ -42,7 +43,20 @@ HTTP
  ├── POST /payments/:id/mark-paid admin Bearer required → mark payment paid
  ├── POST /payments/:id/reopen   admin Bearer required → reopen paid payment
  ├── POST /payments/:id/archive  admin Bearer required → archive payment
- └── DELETE /payments/:id        admin Bearer required → soft-delete payment
+ ├── DELETE /payments/:id        admin Bearer required → soft-delete payment
+ ├── GET /inbox/accounts         admin Bearer required → list inbox accounts
+ ├── POST /inbox/accounts        admin Bearer required → create inbox account
+ ├── GET /inbox/accounts/:id     admin Bearer required → get inbox account
+ ├── PATCH /inbox/accounts/:id   admin Bearer required → update inbox account
+ ├── POST /inbox/accounts/:id/activate admin Bearer required → activate account
+ ├── POST /inbox/accounts/:id/deactivate admin Bearer required → deactivate account
+ ├── GET /inbox                  admin Bearer required → list/search inbox items
+ ├── POST /inbox                 admin Bearer required → ingest inbox item
+ ├── GET /inbox/:id              admin Bearer required → get inbox item (+ rawContent)
+ ├── PATCH /inbox/:id            admin Bearer required → update inbox item
+ ├── POST /inbox/:id/analyze     admin Bearer required → mock AI analysis
+ ├── POST /inbox/:id/archive     admin Bearer required → archive inbox item
+ └── POST /inbox/:id/*-suggestions/:suggestionId/{approve|reject|apply}
 ```
 
 ## WhatsApp status (disabled)
@@ -69,7 +83,7 @@ If a Google refresh token or admin key may have been exposed in older logs, rota
 - Node.js 18+
 - Google Cloud OAuth client (Calendar API enabled)
 - Anthropic API key
-- PostgreSQL (for Contacts/Tasks/Payments APIs and `/health/db`)
+- PostgreSQL (for Contacts/Tasks/Payments/Inbox APIs and `/health/db`)
 
 ### Install
 
@@ -91,7 +105,7 @@ Create a local `.env` file (never commit it), or export variables in your shell.
 | `GOOGLE_REFRESH_TOKEN` | no | Offline refresh token for Calendar access |
 | `PORT` | no | Listen port (default `3000`) |
 | `MY_WHATSAPP` | no | Reserved; unused while WhatsApp is disabled |
-| `DATABASE_URL` | no* | PostgreSQL connection string (`postgresql://...`). Optional for app startup; required for migrations, seeds, Contacts/Tasks/Payments APIs, and `/health/db` to report healthy |
+| `DATABASE_URL` | no* | PostgreSQL connection string (`postgresql://...`). Optional for app startup; required for migrations, seeds, Contacts/Tasks/Payments/Inbox APIs, and `/health/db` to report healthy |
 
 ### Run
 
@@ -117,19 +131,20 @@ export DATABASE_URL="postgresql://USER:PASSWORD@localhost:5432/family_ai_agent?s
 npm test
 ```
 
-Contacts, Tasks, and Payments module coverage (target >95%):
+Contacts, Tasks, Payments, and Inbox module coverage (target >95%):
 
 ```bash
 npm run test:coverage
 npm run test:coverage:tasks
 npm run test:coverage:payments
+npm run test:coverage:inbox
 ```
 
 ## Database (Phase 2 foundation)
 
-Prisma models: `Contact`, `Conversation`, `Message`, `Task`, `CalendarProposal`, `Approval`, `Rule`, `AuditLog`, `Payment`.
+Prisma models: `Contact`, `Conversation`, `Message`, `Task`, `CalendarProposal`, `Approval`, `Rule`, `AuditLog`, `Payment`, `InboxAccount`, `InboxItem`, `InboxTaskSuggestion`, `InboxPaymentSuggestion`, `InboxReplySuggestion`.
 
-Phase 2 added the schema, migrations, seed data, and `GET /health/db`. The Contacts HTTP API is Phase 3. The Tasks API is Phase 4. The Payments Due Engine is Phase 5 (below). WhatsApp is not integrated.
+Phase 2 added the schema, migrations, seed data, and `GET /health/db`. The Contacts HTTP API is Phase 3. The Tasks API is Phase 4. The Payments Due Engine is Phase 5. The Multi-Inbox AI Inbox is Phase 6 (below). WhatsApp is not integrated.
 
 ### Local database
 
@@ -609,6 +624,101 @@ Returns:
 
 Archived, cancelled, and soft-deleted payments are excluded. `totalsByCurrency` groups the actionable set (due soon + overdue) by currency only. `totalsByBusinessUnit` groups by **both** `businessUnit` and `currency` so unlike currencies are never combined. Amounts are decimal strings.
 
+## Multi-Inbox AI Inbox (Phase 6)
+
+Central inbox pipeline that monitors **multiple accounts** (Gmail, Outlook, WhatsApp, SMS, Manual, API) with account isolation and later sync providers. Contacts, Tasks, and Payments APIs are unchanged.
+
+All routes require:
+
+```http
+Authorization: Bearer <ADMIN_API_KEY>
+```
+
+### Multi-account design
+
+- Each `InboxAccount` has its own `source`, optional `emailAddress` / `externalAccountId`, `isActive` flag, and independent `syncCursor` / `lastSyncedAt`.
+- Every `InboxItem` stores `inboxAccountId` — the account provenance is never dropped.
+- Messages from different accounts are **never merged** merely because they share an `externalId`.
+- Unique protection is scoped per account: `@@unique([inboxAccountId, externalId])`. The same provider message id may exist on account A and account B; a duplicate within one account returns `409`.
+
+### Sync cursor behavior
+
+Gmail OAuth and polling are **not** implemented yet. Sync uses clean provider interfaces:
+
+- `listNewMessages(account, cursor)`
+- `fetchMessage(account, externalId)`
+- `saveSyncCursor(account, cursor)`
+
+Each account keeps its own cursor. Stub providers return empty message lists until real connectors are wired. Saving a cursor updates `syncCursor` and `lastSyncedAt` for that account only.
+
+### Suggestion approval workflow
+
+AI analysis **never** auto-creates Tasks or Payments.
+
+1. `POST /inbox/:id/analyze` runs the mock analysis provider and persists `InboxTaskSuggestion` / `InboxPaymentSuggestion` / `InboxReplySuggestion` rows as `PENDING`.
+2. `POST .../approve` → `APPROVED` (idempotent if already approved).
+3. `POST .../reject` → `REJECTED` (cannot reject `APPLIED`).
+4. `POST .../apply` creates a Task or Payment **only after approval**, links it back via `appliedTaskId` / `appliedPaymentId` and `Task.inboxItemId` / `Payment.inboxItemId`, and sets status `APPLIED`. Re-applying is **idempotent** and returns the same entity.
+
+Reply suggestions have no outbound send yet — `apply` only marks them `APPLIED` after approval.
+
+### Security rules
+
+- Admin Bearer auth on every `/inbox` route.
+- Zod validation on bodies, query params, and ids.
+- List endpoints **omit `rawContent`** by default; detail (`GET /inbox/:id`) includes it.
+- Responses never expose OAuth tokens, credentials, database/Prisma details, or raw provider errors.
+- Mock analysis returns concise user-facing reasons only (no chain-of-thought). Anthropic is not called from the inbox analyzer yet.
+
+### Inbox accounts
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_API_KEY" https://YOUR_HOST/inbox/accounts
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{"name":"Personal Gmail","source":"GMAIL","emailAddress":"me@example.com"}' \
+  https://YOUR_HOST/inbox/accounts
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
+  https://YOUR_HOST/inbox/accounts/:id/deactivate
+```
+
+Sources: `GMAIL` | `OUTLOOK` | `WHATSAPP` | `SMS` | `MANUAL` | `API`.
+
+### Inbox items
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{"inboxAccountId":"...","externalId":"msg-1","senderIdentifier":"a@b.com","subject":"Invoice","rawContent":"...","receivedAt":"2026-07-20T10:00:00.000Z"}' \
+  https://YOUR_HOST/inbox
+
+curl -H "Authorization: Bearer $ADMIN_API_KEY" \
+  "https://YOUR_HOST/inbox?inboxAccountId=...&source=GMAIL&status=NEW&urgency=HIGH&senderIdentifier=a@b.com&receivedFrom=2026-07-01T00:00:00.000Z&receivedTo=2026-07-31T23:59:59.000Z&q=invoice&page=1&limit=20&sort=receivedAt"
+```
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `q` | — | Search `senderName`, `senderIdentifier`, `subject`, `summary` |
+| `inboxAccountId` / `source` / `status` / `urgency` / `senderIdentifier` | — | Filters |
+| `receivedFrom` / `receivedTo` | — | Inclusive received-at range |
+| `page` / `limit` | `1` / `20` | Pagination (`limit` max `100`) |
+| `sort` | `receivedAt` | `receivedAt` \| `updatedAt` \| `urgency` |
+
+Statuses: `NEW` | `PROCESSING` | `READY_FOR_REVIEW` | `APPROVED` | `REJECTED` | `ARCHIVED` | `FAILED`.  
+Urgency: `LOW` | `MEDIUM` | `HIGH` | `URGENT`.
+
+### Analyze + suggestions
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" https://YOUR_HOST/inbox/:id/analyze
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
+  https://YOUR_HOST/inbox/:id/task-suggestions/:suggestionId/approve
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
+  https://YOUR_HOST/inbox/:id/task-suggestions/:suggestionId/apply
+```
+
+Same approve/reject/apply paths exist for `payment-suggestions` and `reply-suggestions`.
+
+Mock analysis returns `{ summary, urgency, confidence, suggestedTasks, suggestedPayments, suggestedReplies }` with per-suggestion `confidence`, `reason`, and `evidence`.
+
 ## Railway environment variables
 
 Set the same variables in the Railway project:
@@ -620,7 +730,7 @@ Set the same variables in the Railway project:
 - `ADMIN_API_KEY` — long random secret
 - `GOOGLE_REFRESH_TOKEN` — after completing `/auth` once
 - `PORT` — usually injected by Railway
-- `DATABASE_URL` — from the Railway PostgreSQL plugin (required for DB features and Contacts/Tasks/Payments APIs)
+- `DATABASE_URL` — from the Railway PostgreSQL plugin (required for DB features and Contacts/Tasks/Payments/Inbox APIs)
 
 Also add the same redirect URI in Google Cloud Console → OAuth client → Authorized redirect URIs.
 
@@ -667,6 +777,10 @@ See [Tasks API (Phase 4)](#tasks-api-phase-4) above.
 
 See [Payments Due Engine (Phase 5)](#payments-due-engine-phase-5) above.
 
+### Inbox (protected)
+
+See [Multi-Inbox AI Inbox (Phase 6)](#multi-inbox-ai-inbox-phase-6) above.
+
 ## Google OAuth scopes
 
 Only:
@@ -687,3 +801,4 @@ Gmail scopes are not requested.
 8. Confirm Contacts CRUD works with a Bearer token (list/create/get/patch/soft-delete).
 9. Confirm Tasks API works with a Bearer token (list/create/get/patch/complete/reopen/archive).
 10. Confirm Payments Due Engine works with a Bearer token (list/create/get/patch/approve/mark-paid/reopen/archive/soft-delete and weekly report).
+11. Confirm Multi-Inbox AI Inbox works with a Bearer token (accounts, ingest, list without rawContent, analyze, suggestion approve/apply).

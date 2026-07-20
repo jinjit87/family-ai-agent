@@ -55,17 +55,22 @@ async function main() {
     update: {
       title: 'Review upcoming family calendar',
       description: 'Confirm school and activity events for the next week.',
-      status: 'PENDING',
+      status: 'OPEN',
       priority: 'MEDIUM',
+      source: 'MANUAL',
       contactId: contact.id,
+      conversationId: conversation.id,
+      completedAt: null,
     },
     create: {
       id: 'seed_task_review_calendar',
       title: 'Review upcoming family calendar',
       description: 'Confirm school and activity events for the next week.',
-      status: 'PENDING',
+      status: 'OPEN',
       priority: 'MEDIUM',
+      source: 'MANUAL',
       contactId: contact.id,
+      conversationId: conversation.id,
     },
   });
 

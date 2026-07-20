@@ -27,6 +27,7 @@ const {
   isForeignKeyError,
   formatAmount,
   sumTotalsBy,
+  sumTotalsByBusinessUnitAndCurrency,
   createPayment,
   listPayments,
   updatePayment,
@@ -101,11 +102,16 @@ describe('payments Zod schemas', () => {
     assert.equal(extra.success, false);
   });
 
-  it('validates decimal amounts and rejects floating-point numbers', () => {
+  it('validates decimal amounts and rejects floating-point, zero, and negative', () => {
     assert.equal(amountSchema.parse('123.4567'), '123.4567');
     assert.equal(amountSchema.parse(100), '100');
     assert.equal(amountSchema.safeParse(10.5).success, false);
     assert.equal(amountSchema.safeParse('-1').success, false);
+    assert.equal(amountSchema.safeParse(-1).success, false);
+    assert.equal(amountSchema.safeParse('0').success, false);
+    assert.equal(amountSchema.safeParse('0.00').success, false);
+    assert.equal(amountSchema.safeParse('0.0000').success, false);
+    assert.equal(amountSchema.safeParse(0).success, false);
     assert.equal(amountSchema.safeParse('1.23456').success, false);
     assert.equal(amountSchema.safeParse('abc').success, false);
     assert.equal(amountSchema.safeParse(Number.POSITIVE_INFINITY).success, false);
@@ -303,6 +309,24 @@ describe('payments helpers', () => {
     const byBu = sumTotalsBy(rows, (p) => p.businessUnit);
     assert.ok(byBu.some((r) => r.key === 'MILA' && r.total === '15.1000'));
   });
+
+  it('sumTotalsByBusinessUnitAndCurrency never combines unlike currencies', () => {
+    const rows = [
+      { amount: '15000.0000', currency: 'ILS', businessUnit: 'HOUSE' },
+      { amount: '4200.0000', currency: 'USD', businessUnit: 'HOUSE' },
+      { amount: '100.0000', currency: 'ILS', businessUnit: 'HOUSE' },
+      { amount: '50.0000', currency: 'EUR', businessUnit: 'MILA' },
+    ];
+    const totals = sumTotalsByBusinessUnitAndCurrency(rows);
+    assert.deepEqual(totals, [
+      { businessUnit: 'HOUSE', currency: 'ILS', total: '15100.0000' },
+      { businessUnit: 'HOUSE', currency: 'USD', total: '4200.0000' },
+      { businessUnit: 'MILA', currency: 'EUR', total: '50.0000' },
+    ]);
+    const house = totals.filter((t) => t.businessUnit === 'HOUSE');
+    assert.equal(house.length, 2);
+    assert.ok(house.every((t) => t.currency === 'ILS' || t.currency === 'USD'));
+  });
 });
 
 describe('Payments API', () => {
@@ -413,22 +437,48 @@ describe('Payments API', () => {
     await request(app).delete('/payments/some-id').expect(401);
   });
 
-  it('production mount order: /payments hits auth/router before catch-all 404', async () => {
+  it('production mount order: /payments/reports/weekly before /:id; auth before catch-all', async () => {
+    // Unauthenticated weekly report → 401 (not 404): adminAuth runs; route is registered.
+    const unauthWeekly = await request(app).get('/payments/reports/weekly');
+    assert.equal(unauthWeekly.status, 401);
+    assert.notEqual(unauthWeekly.status, 404);
+    assert.equal(unauthWeekly.body.error, 'Unauthorized');
+
+    // Unauthenticated list → 401 (not 404).
     const unauth = await request(app).get('/payments');
     assert.equal(unauth.status, 401);
     assert.notEqual(unauth.status, 404);
-    assert.equal(unauth.body.error, 'Unauthorized');
 
+    // Authenticated weekly report reaches the report handler (not :id).
+    const originalGetById = payments.getPaymentById;
+    let getByIdCalls = 0;
+    payments.getPaymentById = async (...args) => {
+      getByIdCalls += 1;
+      return originalGetById(...args);
+    };
+    try {
+      const weekly = await auth(request(app).get('/payments/reports/weekly')).expect(200);
+      assert.ok(Array.isArray(weekly.body.dueInNext7Days));
+      assert.ok(Array.isArray(weekly.body.overdue));
+      assert.ok(Array.isArray(weekly.body.totalsByCurrency));
+      assert.ok(Array.isArray(weekly.body.totalsByBusinessUnit));
+      assert.equal(typeof weekly.body.pendingApprovalCount, 'number');
+      assert.equal(typeof weekly.body.overdueCount, 'number');
+      // Must not have been treated as GET /payments/:id with id="reports".
+      assert.equal(getByIdCalls, 0);
+    } finally {
+      payments.getPaymentById = originalGetById;
+    }
+
+    // Authenticated list still works.
     const authed = await auth(request(app).get('/payments')).expect(200);
     assert.ok(Array.isArray(authed.body.data));
     assert.equal(typeof authed.body.pagination, 'object');
 
-    const weekly = await auth(request(app).get('/payments/reports/weekly')).expect(200);
-    assert.ok(Array.isArray(weekly.body.dueInNext7Days));
-    assert.ok(Array.isArray(weekly.body.overdue));
-
+    // Unknown route still hits the final catch-all 404.
     const missing = await request(app).get('/definitely-not-a-real-route').expect(404);
     assert.equal(missing.body.error, 'Not found');
+    assert.notEqual(missing.status, 401);
   });
 
   it('POST /payments creates a payment with decimal amount and defaults', async () => {
@@ -454,7 +504,7 @@ describe('Payments API', () => {
     assert.equal(res.body.deletedAt, null);
   });
 
-  it('POST /payments returns 400 for invalid payloads and floating amounts', async () => {
+  it('POST /payments returns 400 for invalid payloads, floats, zero, and bad currency', async () => {
     const missing = await auth(request(app).post('/payments')).send({ payeeName: 'X' }).expect(400);
     assert.equal(missing.body.error, 'Validation failed');
 
@@ -468,6 +518,30 @@ describe('Payments API', () => {
       })
       .expect(400);
     assert.equal(floatAmount.body.error, 'Validation failed');
+
+    const zeroAmount = await auth(request(app).post('/payments'))
+      .send({
+        payeeName: '[test-payments] Zero',
+        businessUnit: 'HOUSE',
+        amount: '0',
+        currency: 'USD',
+        dueDate: daysFromNow(1),
+        notes: '[test-payments] zero',
+      })
+      .expect(400);
+    assert.equal(zeroAmount.body.error, 'Validation failed');
+
+    const negativeAmount = await auth(request(app).post('/payments'))
+      .send({
+        payeeName: '[test-payments] Negative',
+        businessUnit: 'HOUSE',
+        amount: '-5.00',
+        currency: 'USD',
+        dueDate: daysFromNow(1),
+        notes: '[test-payments] negative',
+      })
+      .expect(400);
+    assert.equal(negativeAmount.body.error, 'Validation failed');
 
     const badCurrency = await auth(request(app).post('/payments'))
       .send({
@@ -762,10 +836,16 @@ describe('Payments API', () => {
     await auth(request(app).post('/payments/missing/reopen')).expect(404);
   });
 
-  it('POST /payments/:id/archive archives a payment', async () => {
+  it('POST /payments/:id/archive archives a payment and preserves paidAt', async () => {
     const created = await createFixture({ payeeName: '[test-payments] Archive Me' });
+    const paid = await auth(request(app).post(`/payments/${created.id}/mark-paid`))
+      .send({ paymentMethod: 'cash' })
+      .expect(200);
+    assert.ok(paid.body.paidAt);
+
     const archived = await auth(request(app).post(`/payments/${created.id}/archive`)).expect(200);
     assert.equal(archived.body.status, 'ARCHIVED');
+    assert.equal(archived.body.paidAt, paid.body.paidAt);
 
     await auth(request(app).post(`/payments/${created.id}/archive`)).expect(409);
     await auth(request(app).post('/payments/missing/archive')).expect(404);
@@ -851,14 +931,158 @@ describe('Payments API', () => {
     // 100.00 + 50.25 from overdue + due soon (paid/archived excluded)
     assert.ok(Number(ilsTotal.total) >= 150.25);
 
-    const houseTotal = report.body.totalsByBusinessUnit.find((t) => t.businessUnit === 'HOUSE');
-    assert.ok(houseTotal);
-    assert.equal(typeof houseTotal.total, 'string');
+    // totalsByBusinessUnit always includes currency — never a bare businessUnit-only total
+    for (const row of report.body.totalsByBusinessUnit) {
+      assert.equal(typeof row.businessUnit, 'string');
+      assert.equal(typeof row.currency, 'string');
+      assert.equal(row.currency.length, 3);
+      assert.equal(typeof row.total, 'string');
+    }
+    const houseIls = report.body.totalsByBusinessUnit.find(
+      (t) => t.businessUnit === 'HOUSE' && t.currency === 'ILS'
+    );
+    assert.ok(houseIls);
+    assert.equal(typeof houseIls.total, 'string');
 
     // Overdue is computed even when stored status is APPROVED, not OVERDUE
     const overdueRow = report.body.overdue.find((p) => p.id === overduePayment.id);
     assert.equal(overdueRow.status, 'APPROVED');
     assert.equal(overdueRow.isOverdue, true);
+  });
+
+  it('weekly report keeps ILS and USD separate for the same business unit', async () => {
+    await createFixture({
+      payeeName: '[test-payments] Mixed FX ILS',
+      amount: '15000.0000',
+      currency: 'ILS',
+      businessUnit: 'HOUSE',
+      status: 'APPROVED',
+      dueDate: daysFromNow(1),
+    });
+    await createFixture({
+      payeeName: '[test-payments] Mixed FX USD',
+      amount: '4200.0000',
+      currency: 'USD',
+      businessUnit: 'HOUSE',
+      status: 'APPROVED',
+      dueDate: daysFromNow(2),
+    });
+
+    const report = await auth(request(app).get('/payments/reports/weekly')).expect(200);
+    const houseRows = report.body.totalsByBusinessUnit.filter((t) => t.businessUnit === 'HOUSE');
+    const ils = houseRows.find((t) => t.currency === 'ILS');
+    const usd = houseRows.find((t) => t.currency === 'USD');
+    assert.ok(ils, 'expected HOUSE/ILS total');
+    assert.ok(usd, 'expected HOUSE/USD total');
+    assert.ok(Number(ils.total) >= 15000);
+    assert.ok(Number(usd.total) >= 4200);
+    // Must never sum ILS+USD into a single HOUSE row without currency
+    assert.ok(!houseRows.some((t) => !t.currency));
+    assert.notEqual(ils.total, usd.total);
+
+    // totalsByCurrency remains a separate field
+    assert.ok(report.body.totalsByCurrency.some((t) => t.currency === 'ILS'));
+    assert.ok(report.body.totalsByCurrency.some((t) => t.currency === 'USD'));
+  });
+
+  it('weekly report excludes cancelled/archived/soft-deleted and handles window boundaries', async () => {
+    const now = new Date('2026-07-20T12:00:00.000Z');
+    const inSevenDays = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+
+    const atStart = await createPayment({
+      payeeName: '[test-payments] Boundary Start',
+      businessUnit: 'HOUSE',
+      amount: '11',
+      currency: 'ILS',
+      dueDate: now.toISOString(),
+      status: 'APPROVED',
+      notes: '[test-payments] boundary start',
+    });
+    createdPaymentIds.push(atStart.id);
+
+    const atEnd = await createPayment({
+      payeeName: '[test-payments] Boundary End',
+      businessUnit: 'HOUSE',
+      amount: '12',
+      currency: 'ILS',
+      dueDate: inSevenDays.toISOString(),
+      status: 'APPROVED',
+      notes: '[test-payments] boundary end',
+    });
+    createdPaymentIds.push(atEnd.id);
+
+    const afterEnd = await createPayment({
+      payeeName: '[test-payments] Boundary After',
+      businessUnit: 'HOUSE',
+      amount: '13',
+      currency: 'ILS',
+      dueDate: new Date(inSevenDays.getTime() + 1).toISOString(),
+      status: 'APPROVED',
+      notes: '[test-payments] boundary after',
+    });
+    createdPaymentIds.push(afterEnd.id);
+
+    const justBefore = await createPayment({
+      payeeName: '[test-payments] Boundary Before',
+      businessUnit: 'HOUSE',
+      amount: '14',
+      currency: 'ILS',
+      dueDate: new Date(now.getTime() - 1).toISOString(),
+      status: 'APPROVED',
+      notes: '[test-payments] boundary before',
+    });
+    createdPaymentIds.push(justBefore.id);
+
+    const cancelled = await createPayment({
+      payeeName: '[test-payments] Boundary Cancelled',
+      businessUnit: 'HOUSE',
+      amount: '15',
+      currency: 'ILS',
+      dueDate: daysFromNow(-1),
+      status: 'CANCELLED',
+      notes: '[test-payments] boundary cancelled',
+    });
+    createdPaymentIds.push(cancelled.id);
+
+    const toArchive = await createPayment({
+      payeeName: '[test-payments] Boundary To Archive',
+      businessUnit: 'HOUSE',
+      amount: '16',
+      currency: 'ILS',
+      dueDate: daysFromNow(-1),
+      status: 'APPROVED',
+      notes: '[test-payments] boundary archive',
+    });
+    createdPaymentIds.push(toArchive.id);
+    await archivePayment(toArchive.id);
+
+    const toDelete = await createPayment({
+      payeeName: '[test-payments] Boundary Soft Delete',
+      businessUnit: 'HOUSE',
+      amount: '17',
+      currency: 'ILS',
+      dueDate: daysFromNow(1),
+      status: 'APPROVED',
+      notes: '[test-payments] boundary soft delete',
+    });
+    createdPaymentIds.push(toDelete.id);
+    await softDeletePayment(toDelete.id);
+
+    const report = await getWeeklyReport({ now });
+
+    assert.ok(report.dueInNext7Days.some((p) => p.id === atStart.id), 'due exactly at now → due soon');
+    assert.ok(report.dueInNext7Days.some((p) => p.id === atEnd.id), 'due exactly at now+7d → due soon');
+    assert.ok(!report.overdue.some((p) => p.id === atStart.id), 'due exactly at now is not overdue');
+    assert.ok(report.overdue.some((p) => p.id === justBefore.id), 'due 1ms before now → overdue');
+    assert.ok(!report.dueInNext7Days.some((p) => p.id === afterEnd.id));
+    assert.ok(!report.overdue.some((p) => p.id === afterEnd.id));
+
+    assert.ok(!report.dueInNext7Days.some((p) => p.id === cancelled.id));
+    assert.ok(!report.overdue.some((p) => p.id === cancelled.id));
+    assert.ok(!report.dueInNext7Days.some((p) => p.id === toArchive.id));
+    assert.ok(!report.overdue.some((p) => p.id === toArchive.id));
+    assert.ok(!report.dueInNext7Days.some((p) => p.id === toDelete.id));
+    assert.ok(!report.overdue.some((p) => p.id === toDelete.id));
   });
 
   it('rejects invalid contactId without leaking Prisma details', async () => {

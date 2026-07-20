@@ -436,10 +436,17 @@ Authorization: Bearer <ADMIN_API_KEY>
 | Approve (`POST .../approve`) | Sets `status=APPROVED` and `approvedAt` (preserves existing). Conflict (`409`) if already `PAID` / `CANCELLED` / `ARCHIVED`. |
 | Mark paid (`POST .../mark-paid`) | Sets `status=PAID` and `paidAt`. **Requires** `paymentMethod` **or** `notes` explaining the payment. Conflict if already paid / cancelled / archived. |
 | Reopen (`POST .../reopen`) | Clears `paidAt`, sets `status=APPROVED`. Only paid payments can be reopened. |
-| Archive (`POST .../archive`) | Sets `status=ARCHIVED`. Archived (and cancelled) payments are hidden from normal lists and weekly reports unless `includeArchived=true`. |
+| Archive (`POST .../archive`) | Sets `status=ARCHIVED` and **preserves** `paidAt` when previously paid (historical payment time is intentional). Archived (and cancelled) payments are hidden from normal lists and weekly reports unless `includeArchived=true`. |
 | Soft delete (`DELETE .../:id`) | Sets `deletedAt`. Soft-deleted payments never appear in list/get/report. Rows are never hard-deleted via the API. |
 
 **Overdue (reports):** a payment is overdue when `dueDate < now`, it is not soft-deleted, and it is not `PAID` / `CANCELLED` / `ARCHIVED`. The stored `status` does not need to be `OVERDUE` for the payment to appear in the overdue section of the weekly report.
+
+**Weekly window boundary (inclusive ends for due-soon):**
+- `dueInNext7Days`: `now <= dueDate <= now + 7 days` and status is not `PAID`
+- `overdue`: `dueDate < now` (strictly before `now`) and not paid/cancelled/archived
+- Due exactly at report `now` → `dueInNext7Days` (not overdue)
+- Due exactly at `now + 7 days` → `dueInNext7Days`
+- Due after the window end → excluded from both buckets
 
 Invalid bodies/queries return `400` with `{ error: "Validation failed", details: [...] }` (Zod). Invalid `contactId` foreign keys return `400` with a safe message (no Prisma details). Missing payments return `404`. Unauthenticated requests return `401`. Invalid lifecycle transitions return `409`.
 
@@ -453,7 +460,7 @@ Invalid bodies/queries return `400` with `{ error: "Validation failed", details:
 | `businessUnit` | enum | `TERAMIND` \| `MILA` \| `TAURUS` \| `DOLCE_MILA` \| `HOUSE` \| `FAMILY` \| `OTHER` |
 | `category` | string \| null | optional |
 | `description` | string \| null | optional |
-| `amount` | decimal string | required; up to 4 fractional digits; never a float |
+| `amount` | decimal string | required; **greater than zero**; up to 4 fractional digits; never a float. Zero and negative amounts are rejected. |
 | `currency` | string | ISO 4217 three-letter code (`ILS`, `USD`, `EUR`, `GBP`, …) |
 | `dueDate` | ISO datetime | required |
 | `status` | enum | `DRAFT` \| `PENDING_APPROVAL` \| `APPROVED` \| `PAID` \| `OVERDUE` \| `CANCELLED` \| `ARCHIVED` (default `DRAFT`) |
@@ -506,7 +513,7 @@ curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
   https://YOUR_HOST/payments
 ```
 
-Returns `201`. Prefer decimal **strings** for `amount` (e.g. `"450.50"`). Integer JSON numbers are accepted; floating-point numbers are rejected.
+Returns `201`. Prefer decimal **strings** for `amount` (e.g. `"450.50"`). Integer JSON numbers greater than zero are accepted; floating-point numbers, zero, and negatives are rejected.
 
 ### Get by id
 
@@ -564,6 +571,8 @@ curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
   https://YOUR_HOST/payments/:id/archive
 ```
 
+Sets `status` to `ARCHIVED` and **preserves** `paidAt` when the payment was previously paid.
+
 ### Soft delete
 
 ```bash
@@ -586,16 +595,19 @@ Returns:
 {
   "generatedAt": "2026-07-20T12:00:00.000Z",
   "window": { "from": "...", "to": "..." },
-  "dueInNext7Days": [ /* unpaid payments due within 7 days */ ],
-  "overdue": [ /* unpaid past-due payments (computed) */ ],
+  "dueInNext7Days": [ /* unpaid payments with now <= dueDate <= now+7days */ ],
+  "overdue": [ /* unpaid past-due payments (dueDate < now, computed) */ ],
   "totalsByCurrency": [{ "currency": "ILS", "total": "1700.5000" }],
-  "totalsByBusinessUnit": [{ "businessUnit": "HOUSE", "total": "450.5000" }],
+  "totalsByBusinessUnit": [
+    { "businessUnit": "HOUSE", "currency": "ILS", "total": "15000.0000" },
+    { "businessUnit": "HOUSE", "currency": "USD", "total": "4200.0000" }
+  ],
   "pendingApprovalCount": 1,
   "overdueCount": 2
 }
 ```
 
-Archived, cancelled, and soft-deleted payments are excluded. Totals are decimal strings grouped by currency and by business unit for the actionable set (due soon + overdue).
+Archived, cancelled, and soft-deleted payments are excluded. `totalsByCurrency` groups the actionable set (due soon + overdue) by currency only. `totalsByBusinessUnit` groups by **both** `businessUnit` and `currency` so unlike currencies are never combined. Amounts are decimal strings.
 
 ## Railway environment variables
 
@@ -608,7 +620,7 @@ Set the same variables in the Railway project:
 - `ADMIN_API_KEY` — long random secret
 - `GOOGLE_REFRESH_TOKEN` — after completing `/auth` once
 - `PORT` — usually injected by Railway
-- `DATABASE_URL` — from the Railway PostgreSQL plugin (required for DB features and Contacts/Tasks APIs)
+- `DATABASE_URL` — from the Railway PostgreSQL plugin (required for DB features and Contacts/Tasks/Payments APIs)
 
 Also add the same redirect URI in Google Cloud Console → OAuth client → Authorized redirect URIs.
 

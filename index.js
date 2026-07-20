@@ -6,6 +6,7 @@ const { createContactsRouter } = require('./lib/contactsRouter');
 const { createTasksRouter } = require('./lib/tasksRouter');
 const { createPaymentsRouter } = require('./lib/paymentsRouter');
 const { createInboxRouter } = require('./lib/inboxRouter');
+const { createGmailRouter } = require('./lib/gmailRouter');
 
 const SERVICE_NAME = 'family-ai-agent';
 const CALENDAR_READONLY_SCOPE = 'https://www.googleapis.com/auth/calendar.readonly';
@@ -27,10 +28,23 @@ function requireAdmin(env) {
 }
 
 function createOAuthClient(env) {
+  // Calendar OAuth uses /auth/callback. Gmail MVP sets GOOGLE_REDIRECT_URI to /gmail/callback.
+  // Derive the calendar redirect so both flows can share one Google OAuth client.
+  let redirectUri = env.GOOGLE_REDIRECT_URI;
+  try {
+    const url = new URL(env.GOOGLE_REDIRECT_URI);
+    if (url.pathname === '/gmail/callback' || url.pathname.endsWith('/gmail/callback')) {
+      url.pathname = '/auth/callback';
+      redirectUri = url.toString();
+    }
+  } catch (_e) {
+    // Keep configured URI if parsing fails.
+  }
+
   const oauth2Client = new google.auth.OAuth2(
     env.GOOGLE_CLIENT_ID,
     env.GOOGLE_CLIENT_SECRET,
-    env.GOOGLE_REDIRECT_URI
+    redirectUri
   );
 
   if (env.GOOGLE_REFRESH_TOKEN) {
@@ -228,6 +242,11 @@ function createApp(env) {
 
   // Phase 6: Multi-Inbox AI Inbox (additive — does not alter existing endpoints).
   app.use('/inbox', createInboxRouter({ adminAuth }));
+
+  // Gmail connector MVP (multi-account OAuth + manual sync).
+  // /gmail/callback is public (browser redirect); other /gmail routes require admin Bearer.
+  // Bearer token is never placed in browser URLs — connect issues a signed state instead.
+  app.use('/gmail', createGmailRouter({ adminAuth, env }));
 
   // Final catch-all — must remain the last route/middleware.
   app.use((_req, res) => {

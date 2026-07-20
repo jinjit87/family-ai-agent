@@ -97,6 +97,34 @@ enum RuleCategory {
   GENERAL
 }
 
+enum PaymentStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  PAID
+  OVERDUE
+  CANCELLED
+  ARCHIVED
+}
+
+enum PaymentSource {
+  MANUAL
+  EMAIL
+  WHATSAPP
+  INVOICE
+  AI
+}
+
+enum BusinessUnit {
+  TERAMIND
+  MILA
+  TAURUS
+  DOLCE_MILA
+  HOUSE
+  FAMILY
+  OTHER
+}
+
 // ---- Models ----
 
 model Contact {
@@ -114,6 +142,7 @@ model Contact {
   conversations     Conversation[]
   tasks             Task[]
   calendarProposals CalendarProposal[]
+  payments          Payment[]
 
   @@index([phone])
   @@index([email])
@@ -258,4 +287,37 @@ model AuditLog {
   @@index([action])
   @@index([entityType, entityId])
   @@index([createdAt])
+}
+
+model Payment {
+  id             String         @id @default(cuid())
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  deletedAt      DateTime?
+  payeeName      String
+  contactId      String?
+  businessUnit   BusinessUnit
+  category       String?
+  description    String?
+  amount         Decimal        @db.Decimal(19, 4)
+  currency       String         @db.Char(3)
+  dueDate        DateTime
+  status         PaymentStatus  @default(DRAFT)
+  invoiceNumber  String?
+  paymentMethod  String?
+  paidAt         DateTime?
+  approvedAt     DateTime?
+  notes          String?
+  source         PaymentSource  @default(MANUAL)
+
+  contact Contact? @relation(fields: [contactId], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([businessUnit])
+  @@index([currency])
+  @@index([contactId])
+  @@index([dueDate])
+  @@index([updatedAt])
+  @@index([deletedAt])
+  @@index([payeeName])
 }

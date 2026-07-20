@@ -10,6 +10,7 @@ Family AI assistant for calendar-aware briefings (Anthropic + Google Calendar).
 - **Database:** PostgreSQL via Prisma (Phase 2 foundation)
 - **Contacts API:** CRUD over Prisma `Contact` (Phase 3)
 - **Tasks API:** task management over Prisma `Task` (Phase 4)
+- **Payments API:** payments due engine over Prisma `Payment` (Phase 5)
 - **Auth:** shared admin secret (`ADMIN_API_KEY`) for operational HTTP routes
 - **Hosting:** Railway-compatible (`Procfile`, `PORT`)
 
@@ -31,7 +32,17 @@ HTTP
  ├── PATCH /tasks/:id            admin Bearer required → update task
  ├── POST /tasks/:id/complete    admin Bearer required → complete task
  ├── POST /tasks/:id/reopen      admin Bearer required → reopen task
- └── POST /tasks/:id/archive     admin Bearer required → archive task
+ ├── POST /tasks/:id/archive     admin Bearer required → archive task
+ ├── GET /payments               admin Bearer required → list/search/filter payments
+ ├── GET /payments/reports/weekly admin Bearer required → weekly due/overdue report
+ ├── GET /payments/:id           admin Bearer required → get payment
+ ├── POST /payments              admin Bearer required → create payment
+ ├── PATCH /payments/:id         admin Bearer required → update payment
+ ├── POST /payments/:id/approve  admin Bearer required → approve payment
+ ├── POST /payments/:id/mark-paid admin Bearer required → mark payment paid
+ ├── POST /payments/:id/reopen   admin Bearer required → reopen paid payment
+ ├── POST /payments/:id/archive  admin Bearer required → archive payment
+ └── DELETE /payments/:id        admin Bearer required → soft-delete payment
 ```
 
 ## WhatsApp status (disabled)
@@ -58,7 +69,7 @@ If a Google refresh token or admin key may have been exposed in older logs, rota
 - Node.js 18+
 - Google Cloud OAuth client (Calendar API enabled)
 - Anthropic API key
-- PostgreSQL (for Contacts/Tasks APIs and `/health/db`)
+- PostgreSQL (for Contacts/Tasks/Payments APIs and `/health/db`)
 
 ### Install
 
@@ -80,7 +91,7 @@ Create a local `.env` file (never commit it), or export variables in your shell.
 | `GOOGLE_REFRESH_TOKEN` | no | Offline refresh token for Calendar access |
 | `PORT` | no | Listen port (default `3000`) |
 | `MY_WHATSAPP` | no | Reserved; unused while WhatsApp is disabled |
-| `DATABASE_URL` | no* | PostgreSQL connection string (`postgresql://...`). Optional for app startup; required for migrations, seeds, Contacts/Tasks APIs, and `/health/db` to report healthy |
+| `DATABASE_URL` | no* | PostgreSQL connection string (`postgresql://...`). Optional for app startup; required for migrations, seeds, Contacts/Tasks/Payments APIs, and `/health/db` to report healthy |
 
 ### Run
 
@@ -106,18 +117,19 @@ export DATABASE_URL="postgresql://USER:PASSWORD@localhost:5432/family_ai_agent?s
 npm test
 ```
 
-Contacts and Tasks module coverage (target >95%):
+Contacts, Tasks, and Payments module coverage (target >95%):
 
 ```bash
 npm run test:coverage
 npm run test:coverage:tasks
+npm run test:coverage:payments
 ```
 
 ## Database (Phase 2 foundation)
 
-Prisma models: `Contact`, `Conversation`, `Message`, `Task`, `CalendarProposal`, `Approval`, `Rule`, `AuditLog`.
+Prisma models: `Contact`, `Conversation`, `Message`, `Task`, `CalendarProposal`, `Approval`, `Rule`, `AuditLog`, `Payment`.
 
-Phase 2 added the schema, migrations, seed data, and `GET /health/db`. The Contacts HTTP API is Phase 3 (below). WhatsApp is not integrated.
+Phase 2 added the schema, migrations, seed data, and `GET /health/db`. The Contacts HTTP API is Phase 3. The Tasks API is Phase 4. The Payments Due Engine is Phase 5 (below). WhatsApp is not integrated.
 
 ### Local database
 
@@ -172,7 +184,7 @@ npm run db:generate
 
 ### Running seeds
 
-Seed creates one `Contact`, one `Conversation`, and one `Task`:
+Seed creates one `Contact`, one `Conversation`, one `Task`, and one `Payment`:
 
 ```bash
 export DATABASE_URL="postgresql://USER:PASSWORD@localhost:5432/family_ai_agent?schema=public"
@@ -406,6 +418,185 @@ curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
 
 Sets `status` to `ARCHIVED` and **preserves** `completedAt` when the task was previously completed (historical completion time is intentional). Archived tasks are hidden from `GET /tasks` unless `includeArchived=true`.
 
+## Payments Due Engine (Phase 5)
+
+Admin-authenticated payment tracking for the Prisma `Payment` model. Amounts are stored and returned as **Decimal strings** (never floating point). Overdue status for reports is computed from `dueDate` at read time — no scheduled database job is required.
+
+All routes require:
+
+```http
+Authorization: Bearer <ADMIN_API_KEY>
+```
+
+### Lifecycle rules
+
+| Action | Behavior |
+|--------|----------|
+| Create | Defaults: `status=DRAFT`, `source=MANUAL`. Creating as `PAID` / `APPROVED` sets `paidAt` / `approvedAt`. |
+| Approve (`POST .../approve`) | Sets `status=APPROVED` and `approvedAt` (preserves existing). Conflict (`409`) if already `PAID` / `CANCELLED` / `ARCHIVED`. |
+| Mark paid (`POST .../mark-paid`) | Sets `status=PAID` and `paidAt`. **Requires** `paymentMethod` **or** `notes` explaining the payment. Conflict if already paid / cancelled / archived. |
+| Reopen (`POST .../reopen`) | Clears `paidAt`, sets `status=APPROVED`. Only paid payments can be reopened. |
+| Archive (`POST .../archive`) | Sets `status=ARCHIVED`. Archived (and cancelled) payments are hidden from normal lists and weekly reports unless `includeArchived=true`. |
+| Soft delete (`DELETE .../:id`) | Sets `deletedAt`. Soft-deleted payments never appear in list/get/report. Rows are never hard-deleted via the API. |
+
+**Overdue (reports):** a payment is overdue when `dueDate < now`, it is not soft-deleted, and it is not `PAID` / `CANCELLED` / `ARCHIVED`. The stored `status` does not need to be `OVERDUE` for the payment to appear in the overdue section of the weekly report.
+
+Invalid bodies/queries return `400` with `{ error: "Validation failed", details: [...] }` (Zod). Invalid `contactId` foreign keys return `400` with a safe message (no Prisma details). Missing payments return `404`. Unauthenticated requests return `401`. Invalid lifecycle transitions return `409`.
+
+### Fields
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | string (cuid) | read-only |
+| `payeeName` | string | required on create |
+| `contactId` | string \| null | optional FK to `Contact` |
+| `businessUnit` | enum | `TERAMIND` \| `MILA` \| `TAURUS` \| `DOLCE_MILA` \| `HOUSE` \| `FAMILY` \| `OTHER` |
+| `category` | string \| null | optional |
+| `description` | string \| null | optional |
+| `amount` | decimal string | required; up to 4 fractional digits; never a float |
+| `currency` | string | ISO 4217 three-letter code (`ILS`, `USD`, `EUR`, `GBP`, …) |
+| `dueDate` | ISO datetime | required |
+| `status` | enum | `DRAFT` \| `PENDING_APPROVAL` \| `APPROVED` \| `PAID` \| `OVERDUE` \| `CANCELLED` \| `ARCHIVED` (default `DRAFT`) |
+| `isOverdue` | boolean | computed at read time (not stored) |
+| `invoiceNumber` | string \| null | optional |
+| `paymentMethod` | string \| null | optional; required (or notes) when marking paid |
+| `paidAt` / `approvedAt` | ISO datetime \| null | set by lifecycle actions |
+| `notes` | string \| null | optional |
+| `source` | enum | `MANUAL` \| `EMAIL` \| `WHATSAPP` \| `INVOICE` \| `AI` (default `MANUAL`) |
+| `createdAt` / `updatedAt` | ISO datetime | read-only |
+| `deletedAt` | ISO datetime \| null | set on soft delete |
+
+### List / search / filter / sort / pagination
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_API_KEY" \
+  "https://YOUR_HOST/payments?q=school&status=APPROVED&businessUnit=FAMILY&currency=ILS&contactId=...&dueFrom=2026-07-01T00:00:00.000Z&dueTo=2026-07-31T23:59:59.000Z&page=1&limit=20&sort=dueDate&includeArchived=false"
+```
+
+Query params:
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `q` | — | Case-insensitive search across **payeeName**, **description**, **invoiceNumber**, and **notes** |
+| `status` | — | Filter by status enum |
+| `businessUnit` | — | Filter by business unit enum |
+| `currency` | — | Filter by ISO 4217 code |
+| `contactId` | — | Filter by related contact id |
+| `dueFrom` / `dueTo` | — | Inclusive due-date range (ISO datetime) |
+| `includeArchived` | `false` | When `false`, `ARCHIVED` and `CANCELLED` never appear |
+| `page` | `1` | 1-based page index |
+| `limit` | `20` | Page size (max `100`) |
+| `sort` | `dueDate` | `dueDate` (asc), `amount` (asc), `updatedAt` (desc), or `payeeName` (asc) |
+
+Response shape:
+
+```json
+{
+  "data": [ /* payment objects */ ],
+  "pagination": { "page": 1, "limit": 20, "total": 3, "totalPages": 1 }
+}
+```
+
+### Create
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"payeeName":"Electric Co","businessUnit":"HOUSE","amount":"450.50","currency":"ILS","dueDate":"2026-07-25T00:00:00.000Z"}' \
+  https://YOUR_HOST/payments
+```
+
+Returns `201`. Prefer decimal **strings** for `amount` (e.g. `"450.50"`). Integer JSON numbers are accepted; floating-point numbers are rejected.
+
+### Get by id
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_API_KEY" https://YOUR_HOST/payments/:id
+```
+
+### Update (partial)
+
+```bash
+curl -X PATCH -H "Authorization: Bearer $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"amount":"475.00","notes":"Adjusted estimate"}' \
+  https://YOUR_HOST/payments/:id
+```
+
+### Approve
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
+  https://YOUR_HOST/payments/:id/approve
+```
+
+### Mark paid
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"paymentMethod":"bank_transfer"}' \
+  https://YOUR_HOST/payments/:id/mark-paid
+```
+
+Or with notes only:
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"notes":"Paid in cash at office"}' \
+  https://YOUR_HOST/payments/:id/mark-paid
+```
+
+### Reopen
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
+  https://YOUR_HOST/payments/:id/reopen
+```
+
+Clears `paidAt` and sets `status` to `APPROVED`.
+
+### Archive
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
+  https://YOUR_HOST/payments/:id/archive
+```
+
+### Soft delete
+
+```bash
+curl -X DELETE -H "Authorization: Bearer $ADMIN_API_KEY" \
+  https://YOUR_HOST/payments/:id
+```
+
+Sets `deletedAt` and returns the payment. A second delete returns `404`.
+
+### Weekly report
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_API_KEY" \
+  https://YOUR_HOST/payments/reports/weekly
+```
+
+Returns:
+
+```json
+{
+  "generatedAt": "2026-07-20T12:00:00.000Z",
+  "window": { "from": "...", "to": "..." },
+  "dueInNext7Days": [ /* unpaid payments due within 7 days */ ],
+  "overdue": [ /* unpaid past-due payments (computed) */ ],
+  "totalsByCurrency": [{ "currency": "ILS", "total": "1700.5000" }],
+  "totalsByBusinessUnit": [{ "businessUnit": "HOUSE", "total": "450.5000" }],
+  "pendingApprovalCount": 1,
+  "overdueCount": 2
+}
+```
+
+Archived, cancelled, and soft-deleted payments are excluded. Totals are decimal strings grouped by currency and by business unit for the actionable set (due soon + overdue).
+
 ## Railway environment variables
 
 Set the same variables in the Railway project:
@@ -460,6 +651,10 @@ See [Contacts API (Phase 3)](#contacts-api-phase-3) above.
 
 See [Tasks API (Phase 4)](#tasks-api-phase-4) above.
 
+### Payments (protected)
+
+See [Payments Due Engine (Phase 5)](#payments-due-engine-phase-5) above.
+
 ## Google OAuth scopes
 
 Only:
@@ -479,3 +674,4 @@ Gmail scopes are not requested.
 7. Confirm `/health/db` returns `"database":"up"`.
 8. Confirm Contacts CRUD works with a Bearer token (list/create/get/patch/soft-delete).
 9. Confirm Tasks API works with a Bearer token (list/create/get/patch/complete/reopen/archive).
+10. Confirm Payments Due Engine works with a Bearer token (list/create/get/patch/approve/mark-paid/reopen/archive/soft-delete and weekly report).

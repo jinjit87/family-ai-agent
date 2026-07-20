@@ -125,6 +125,39 @@ enum BusinessUnit {
   OTHER
 }
 
+enum InboxAccountSource {
+  GMAIL
+  OUTLOOK
+  WHATSAPP
+  SMS
+  MANUAL
+  API
+}
+
+enum InboxStatus {
+  NEW
+  PROCESSING
+  READY_FOR_REVIEW
+  APPROVED
+  REJECTED
+  ARCHIVED
+  FAILED
+}
+
+enum Urgency {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum SuggestionStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  APPLIED
+}
+
 // ---- Models ----
 
 model Contact {
@@ -201,10 +234,15 @@ model Task {
   source         TaskSource   @default(MANUAL)
   contactId      String?
   conversationId String?
+  // Phase 6 provenance — optional; existing Tasks API serializers omit this field.
+  inboxItemId    String?
 
-  contact      Contact?      @relation(fields: [contactId], references: [id], onDelete: SetNull)
-  conversation Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
-  approvals    Approval[]
+  contact              Contact?             @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  conversation         Conversation?        @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  approvals            Approval[]
+  inboxItem            InboxItem?           @relation(fields: [inboxItemId], references: [id], onDelete: SetNull)
+  // Reverse of InboxTaskSuggestion.appliedTaskId — preserves Task → suggestion link.
+  appliedFromSuggestion InboxTaskSuggestion?
 
   @@index([status])
   @@index([priority])
@@ -213,6 +251,7 @@ model Task {
   @@index([conversationId])
   @@index([dueDate])
   @@index([updatedAt])
+  @@index([inboxItemId])
 }
 
 model CalendarProposal {
@@ -309,8 +348,13 @@ model Payment {
   approvedAt     DateTime?
   notes          String?
   source         PaymentSource  @default(MANUAL)
+  // Phase 6 provenance — optional; existing Payments API serializers omit this field.
+  inboxItemId    String?
 
-  contact Contact? @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  contact                 Contact?                @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  inboxItem               InboxItem?              @relation(fields: [inboxItemId], references: [id], onDelete: SetNull)
+  // Reverse of InboxPaymentSuggestion.appliedPaymentId — preserves Payment → suggestion link.
+  appliedFromSuggestion   InboxPaymentSuggestion?
 
   @@index([status])
   @@index([businessUnit])
@@ -320,4 +364,130 @@ model Payment {
   @@index([updatedAt])
   @@index([deletedAt])
   @@index([payeeName])
+  @@index([inboxItemId])
+}
+
+// ---- Phase 6: Multi-Inbox AI Inbox ----
+
+model InboxAccount {
+  id                String             @id @default(cuid())
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+  name              String
+  source            InboxAccountSource
+  emailAddress      String?
+  externalAccountId String?
+  isActive          Boolean            @default(true)
+  lastSyncedAt      DateTime?
+  syncCursor        String?
+
+  items InboxItem[]
+
+  @@index([source])
+  @@index([isActive])
+  @@index([emailAddress])
+  @@index([updatedAt])
+}
+
+model InboxItem {
+  id               String             @id @default(cuid())
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+  inboxAccountId   String
+  source           InboxAccountSource
+  externalId       String
+  threadExternalId String?
+  senderName       String?
+  senderIdentifier String
+  recipients       Json?
+  subject          String?
+  rawContent       String
+  summary          String?
+  status           InboxStatus        @default(NEW)
+  confidence       Float?
+  urgency          Urgency?
+  receivedAt       DateTime
+  processedAt      DateTime?
+
+  inboxAccount        InboxAccount             @relation(fields: [inboxAccountId], references: [id], onDelete: Cascade)
+  taskSuggestions     InboxTaskSuggestion[]
+  paymentSuggestions  InboxPaymentSuggestion[]
+  replySuggestions    InboxReplySuggestion[]
+  createdTasks        Task[]
+  createdPayments     Payment[]
+
+  @@unique([inboxAccountId, externalId])
+  @@index([inboxAccountId])
+  @@index([source])
+  @@index([status])
+  @@index([urgency])
+  @@index([senderIdentifier])
+  @@index([receivedAt])
+  @@index([updatedAt])
+}
+
+model InboxTaskSuggestion {
+  id           String           @id @default(cuid())
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+  inboxItemId  String
+  status       SuggestionStatus @default(PENDING)
+  confidence   Float
+  reason       String
+  title        String
+  description  String?
+  priority     TaskPriority?
+  dueDate      DateTime?
+  contactId    String?
+  evidence     Json?
+  appliedTaskId String?         @unique
+
+  inboxItem InboxItem @relation(fields: [inboxItemId], references: [id], onDelete: Cascade)
+  appliedTask Task? @relation(fields: [appliedTaskId], references: [id], onDelete: SetNull)
+
+  @@index([inboxItemId])
+  @@index([status])
+}
+
+model InboxPaymentSuggestion {
+  id              String           @id @default(cuid())
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  inboxItemId     String
+  status          SuggestionStatus @default(PENDING)
+  confidence      Float
+  reason          String
+  payeeName       String
+  amount          Decimal?         @db.Decimal(19, 4)
+  currency        String?          @db.Char(3)
+  dueDate         DateTime?
+  businessUnit    BusinessUnit?
+  category        String?
+  description     String?
+  invoiceNumber   String?
+  evidence        Json?
+  appliedPaymentId String?         @unique
+
+  inboxItem InboxItem @relation(fields: [inboxItemId], references: [id], onDelete: Cascade)
+  appliedPayment Payment? @relation(fields: [appliedPaymentId], references: [id], onDelete: SetNull)
+
+  @@index([inboxItemId])
+  @@index([status])
+}
+
+model InboxReplySuggestion {
+  id          String           @id @default(cuid())
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  inboxItemId String
+  status      SuggestionStatus @default(PENDING)
+  confidence  Float
+  reason      String
+  replyText   String
+  evidence    Json?
+
+  inboxItem InboxItem @relation(fields: [inboxItemId], references: [id], onDelete: Cascade)
+
+  @@index([inboxItemId])
+  @@index([status])
 }

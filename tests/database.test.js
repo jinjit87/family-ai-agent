@@ -100,7 +100,8 @@ describe('database health helper', () => {
     delete process.env.DATABASE_URL;
     const result = await checkDatabaseHealth();
     assert.equal(result.ok, false);
-    assert.match(result.error, /DATABASE_URL/);
+    assert.equal(typeof result.latencyMs, 'number');
+    assert.equal(result.error, undefined);
   });
 
   it('reports healthy when DATABASE_URL points at a live database', async (t) => {
@@ -118,6 +119,7 @@ describe('database health helper', () => {
 describe('GET /health/db', () => {
   let app;
   const originalUrl = process.env.DATABASE_URL;
+  const ALLOWED_KEYS = ['database', 'latencyMs', 'service', 'status', 'timestamp'];
 
   before(() => {
     const env = loadEnv(VALID_ENV);
@@ -137,7 +139,7 @@ describe('GET /health/db', () => {
     await disconnectPrisma();
   });
 
-  it('returns 503 when DATABASE_URL is not set', async () => {
+  it('returns 503 when DATABASE_URL is not set without leaking internals', async () => {
     delete process.env.DATABASE_URL;
     const res = await request(app).get('/health/db').expect(503);
     assert.equal(res.body.status, 'error');
@@ -145,9 +147,44 @@ describe('GET /health/db', () => {
     assert.equal(res.body.service, SERVICE_NAME);
     assert.equal(typeof res.body.timestamp, 'string');
     assert.equal(typeof res.body.latencyMs, 'number');
+    assert.deepEqual(Object.keys(res.body).sort(), ALLOWED_KEYS);
+    assert.equal(res.body.error, undefined);
+
+    const serialized = JSON.stringify(res.body);
+    assert.doesNotMatch(serialized, /DATABASE_URL/);
+    assert.doesNotMatch(serialized, /postgresql:\/\//i);
+    assert.doesNotMatch(serialized, /Prisma/);
   });
 
-  it('returns 200 when the database is reachable', async (t) => {
+  it('returns 503 on connection failure without exposing secrets or host details', async () => {
+    const secretUser = 'secret_db_user';
+    const secretPass = 'super_secret_db_password';
+    const secretHost = 'db-host.internal.example';
+    const secretDb = 'secret_family_db';
+    // Unreachable host + short timeout so the test fails fast.
+    process.env.DATABASE_URL =
+      `postgresql://${secretUser}:${secretPass}@${secretHost}:5432/${secretDb}` +
+      '?schema=public&connect_timeout=1';
+
+    const res = await request(app).get('/health/db').expect(503);
+    assert.equal(res.body.status, 'error');
+    assert.equal(res.body.database, 'down');
+    assert.deepEqual(Object.keys(res.body).sort(), ALLOWED_KEYS);
+    assert.equal(res.body.error, undefined);
+
+    const serialized = JSON.stringify(res.body);
+    assert.doesNotMatch(serialized, /DATABASE_URL/);
+    assert.doesNotMatch(serialized, new RegExp(secretUser));
+    assert.doesNotMatch(serialized, new RegExp(secretPass));
+    assert.doesNotMatch(serialized, new RegExp(secretHost.replace(/\./g, '\\.')));
+    assert.doesNotMatch(serialized, new RegExp(secretDb));
+    assert.doesNotMatch(serialized, /postgresql:\/\//i);
+    assert.doesNotMatch(serialized, /5432/);
+    assert.doesNotMatch(serialized, /PrismaClient/);
+    assert.doesNotMatch(serialized, /P1001|P1010|ECONNREFUSED|ENOTFOUND/i);
+  });
+
+  it('returns 200 when the database is reachable with only allowed fields', async (t) => {
     if (!originalUrl) {
       t.skip('DATABASE_URL not set; skipping live DB check');
       return;
@@ -157,6 +194,8 @@ describe('GET /health/db', () => {
     assert.equal(res.body.status, 'ok');
     assert.equal(res.body.database, 'up');
     assert.equal(res.body.service, SERVICE_NAME);
+    assert.deepEqual(Object.keys(res.body).sort(), ALLOWED_KEYS);
+    assert.equal(res.body.error, undefined);
   });
 
   it('does not change the public /health contract', async () => {

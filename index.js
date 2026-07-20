@@ -129,19 +129,20 @@ function createApp(env) {
   });
 
   // Database connectivity check (Phase 2). Does not alter /health.
+  // Public body never includes error details, connection strings, or credentials.
   app.get('/health/db', async (_req, res) => {
     const result = await checkDatabaseHealth();
-    const body = {
+    if (!result.ok) {
+      // Generic only — never log DATABASE_URL, credentials, or raw driver errors.
+      console.error('Database health check failed');
+    }
+    return res.status(result.ok ? 200 : 503).json({
       status: result.ok ? 'ok' : 'error',
       database: result.ok ? 'up' : 'down',
       latencyMs: result.latencyMs,
       timestamp: new Date().toISOString(),
       service: SERVICE_NAME,
-    };
-    if (!result.ok && result.error) {
-      body.error = result.error;
-    }
-    return res.status(result.ok ? 200 : 503).json(body);
+    });
   });
 
   // Operational: start Google OAuth (Calendar readonly only).

@@ -163,7 +163,15 @@ Seeds are idempotent (fixed seed IDs via upsert). Safe to re-run locally.
 curl https://YOUR_HOST/health/db
 ```
 
-Returns `200` with `"database":"up"` when Prisma can reach PostgreSQL; `503` with `"database":"down"` otherwise. The existing `/health` endpoint is unchanged.
+Returns `200` when Prisma can reach PostgreSQL, or `503` when it cannot. The public JSON body contains only:
+
+- `status` — `"ok"` or `"error"`
+- `database` — `"up"` or `"down"`
+- `latencyMs`
+- `timestamp`
+- `service`
+
+Internal connection errors are logged server-side with a generic message and are **never** returned to clients (no hostnames, credentials, or driver messages). The existing `/health` endpoint is unchanged.
 
 ## Railway environment variables
 

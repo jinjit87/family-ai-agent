@@ -20,6 +20,11 @@ const VALID_ENV = {
 
 // Set DATABASE_URL before creating the app / Prisma clients.
 process.env.DATABASE_URL = VALID_ENV.DATABASE_URL;
+// Mirror encryption key into process.env so temporary debug log redaction can strip it
+// if it ever appears in an exception message (never log the value itself).
+process.env.TOKEN_ENCRYPTION_KEY = VALID_ENV.TOKEN_ENCRYPTION_KEY;
+process.env.GOOGLE_CLIENT_SECRET = VALID_ENV.GOOGLE_CLIENT_SECRET;
+process.env.ADMIN_API_KEY = VALID_ENV.ADMIN_API_KEY;
 
 const { createApp, loadEnv, createOAuthClient, CALENDAR_READONLY_SCOPE } = require('../index');
 const { getPrisma, disconnectPrisma } = require('../lib/db');
@@ -1818,8 +1823,13 @@ describe('callback HTML escaping and router security paths', () => {
         assert.equal(line.includes('access-token-value'), false);
         assert.equal(line.includes(ENCRYPTION_KEY), false);
         assert.equal(line.includes(VALID_ENV.DATABASE_URL), false);
-        assert.match(line, /Failed to .* gmail resource/);
+        assert.ok(
+          /Failed to .* gmail resource/.test(line) || line.includes('"gmailDebug":true'),
+          `unexpected log line: ${line.slice(0, 120)}`
+        );
       }
+      assert.ok(logs.some((line) => /Failed to .* gmail resource/.test(line)));
+      assert.ok(logs.some((line) => line.includes('"gmailDebug":true')));
     } finally {
       console.error = originalError;
     }

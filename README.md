@@ -58,7 +58,7 @@ If a Google refresh token or admin key may have been exposed in older logs, rota
 - Node.js 18+
 - Google Cloud OAuth client (Calendar API enabled)
 - Anthropic API key
-- PostgreSQL (for Contacts API and `/health/db`)
+- PostgreSQL (for Contacts/Tasks APIs and `/health/db`)
 
 ### Install
 
@@ -106,7 +106,7 @@ export DATABASE_URL="postgresql://USER:PASSWORD@localhost:5432/family_ai_agent?s
 npm test
 ```
 
-Contacts / Tasks module coverage (target >95%):
+Contacts and Tasks module coverage (target >95%):
 
 ```bash
 npm run test:coverage
@@ -295,6 +295,16 @@ All routes require:
 Authorization: Bearer <ADMIN_API_KEY>
 ```
 
+### Lifecycle invariants (`completedAt`)
+
+| Transition | `completedAt` behavior |
+|------------|------------------------|
+| Status becomes `COMPLETED` (create, patch, or `POST .../complete`) | Set (or preserved if already completed) |
+| Task is reopened (`POST .../reopen`, or patch to `OPEN` / `IN_PROGRESS` / `WAITING`) | Cleared to `null` |
+| Task is archived (`POST .../archive`, or patch to `ARCHIVED`) | **Preserved** — historical completion time is kept intentionally |
+
+Invalid bodies/queries return `400` with `{ error: "Validation failed", details: [...] }` (Zod). Invalid `contactId` / `conversationId` foreign keys return `400` with a safe message (no Prisma details). Missing tasks return `404`. Unauthenticated requests return `401`.
+
 ### Fields
 
 | Field | Type | Notes |
@@ -305,13 +315,11 @@ Authorization: Bearer <ADMIN_API_KEY>
 | `priority` | enum | `LOW` \| `MEDIUM` \| `HIGH` \| `URGENT` (default `MEDIUM`) |
 | `status` | enum | `OPEN` \| `IN_PROGRESS` \| `WAITING` \| `COMPLETED` \| `ARCHIVED` (default `OPEN`) |
 | `dueDate` | ISO datetime \| null | optional |
-| `completedAt` | ISO datetime \| null | set automatically on complete / when status becomes `COMPLETED` |
+| `completedAt` | ISO datetime \| null | see lifecycle invariants above |
 | `source` | enum | `MANUAL` \| `EMAIL` \| `WHATSAPP` \| `CALENDAR` \| `AI` (default `MANUAL`) |
 | `contactId` | string \| null | optional FK to `Contact` |
 | `conversationId` | string \| null | optional FK to `Conversation` |
 | `createdAt` / `updatedAt` | ISO datetime | read-only |
-
-Invalid bodies/queries return `400` with `{ error: "Validation failed", details: [...] }` (Zod). Missing tasks return `404`. Unauthenticated requests return `401`.
 
 ### List / search / filter / sort / pagination
 
@@ -369,7 +377,7 @@ curl -X PATCH -H "Authorization: Bearer $ADMIN_API_KEY" \
   https://YOUR_HOST/tasks/:id
 ```
 
-Patching `status` to `COMPLETED` sets `completedAt`. Moving away from `COMPLETED` clears `completedAt`.
+Patching `status` to `COMPLETED` sets `completedAt`. Patching to `OPEN` / `IN_PROGRESS` / `WAITING` clears `completedAt`. Patching to `ARCHIVED` preserves any existing `completedAt`.
 
 ### Complete
 
@@ -396,7 +404,7 @@ curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
   https://YOUR_HOST/tasks/:id/archive
 ```
 
-Sets `status` to `ARCHIVED`. Archived tasks are hidden from `GET /tasks` unless `includeArchived=true`.
+Sets `status` to `ARCHIVED` and **preserves** `completedAt` when the task was previously completed (historical completion time is intentional). Archived tasks are hidden from `GET /tasks` unless `includeArchived=true`.
 
 ## Railway environment variables
 

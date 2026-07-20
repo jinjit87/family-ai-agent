@@ -19,6 +19,8 @@ const {
   buildListWhere,
   buildOrderBy,
   serializeTask,
+  applyCompletedAtLifecycle,
+  isForeignKeyError,
   createTask,
   listTasks,
   updateTask,
@@ -150,6 +152,50 @@ describe('tasks helpers', () => {
     assert.deepEqual(buildOrderBy('updatedAt'), { updatedAt: 'desc' });
   });
 
+  it('applyCompletedAtLifecycle sets, clears, and preserves completedAt correctly', () => {
+    const existingOpen = {
+      id: 't1',
+      status: 'OPEN',
+      completedAt: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      title: 'x',
+      description: null,
+      priority: 'MEDIUM',
+      dueDate: null,
+      source: 'MANUAL',
+      contactId: null,
+      conversationId: null,
+    };
+    const toComplete = {};
+    applyCompletedAtLifecycle('COMPLETED', existingOpen, toComplete);
+    assert.ok(toComplete.completedAt instanceof Date);
+
+    const existingCompleted = {
+      ...existingOpen,
+      status: 'COMPLETED',
+      completedAt: new Date('2026-01-01T00:00:00.000Z'),
+    };
+    const toArchive = {};
+    applyCompletedAtLifecycle('ARCHIVED', existingCompleted, toArchive);
+    assert.equal(Object.prototype.hasOwnProperty.call(toArchive, 'completedAt'), false);
+
+    const toReopen = {};
+    applyCompletedAtLifecycle('OPEN', existingCompleted, toReopen);
+    assert.equal(toReopen.completedAt, null);
+
+    const noop = {};
+    applyCompletedAtLifecycle(undefined, existingCompleted, noop);
+    assert.deepEqual(noop, {});
+  });
+
+  it('isForeignKeyError detects Prisma P2003 only', () => {
+    assert.equal(isForeignKeyError({ code: 'P2003' }), true);
+    assert.equal(isForeignKeyError({ code: 'P2002' }), false);
+    assert.equal(isForeignKeyError(new Error('boom')), false);
+    assert.equal(isForeignKeyError(null), false);
+  });
+
   it('serializeTask formats dates and nullables', () => {
     const now = new Date('2026-07-20T12:00:00.000Z');
     const serialized = serializeTask({
@@ -272,16 +318,26 @@ describe('Tasks API', () => {
     await request(app).post('/tasks/some-id/archive').expect(401);
   });
 
-  it('mounts /tasks before the final catch-all 404 handler', async () => {
-    const unauth = await request(app).get('/tasks').expect(401);
+  it('production mount order: /tasks hits auth/router before catch-all 404', async () => {
+    // GET /tasks without auth → 401 (not 404): adminAuth on Tasks router runs first.
+    const unauth = await request(app).get('/tasks');
+    assert.equal(unauth.status, 401);
+    assert.notEqual(unauth.status, 404);
     assert.equal(unauth.body.error, 'Unauthorized');
+    assert.equal(Object.keys(unauth.body).join(','), 'error');
 
+    // GET /tasks with valid auth → Tasks router list payload.
     const authed = await auth(request(app).get('/tasks')).expect(200);
-    assert.ok(Array.isArray(authed.body.data));
+    assert.ok(Array.isArray(authed.body.data), 'expected Tasks list data array');
     assert.equal(typeof authed.body.pagination, 'object');
+    assert.equal(typeof authed.body.pagination.page, 'number');
+    assert.equal(typeof authed.body.pagination.limit, 'number');
+    assert.equal(typeof authed.body.pagination.total, 'number');
 
+    // Unknown route still hits the final catch-all 404.
     const missing = await request(app).get('/definitely-not-a-real-route').expect(404);
     assert.equal(missing.body.error, 'Not found');
+    assert.notEqual(missing.status, 401);
   });
 
   it('POST /tasks creates a task with defaults', async () => {
@@ -548,13 +604,75 @@ describe('Tasks API', () => {
     await auth(request(app).post('/tasks/missing/reopen')).expect(404);
   });
 
-  it('POST /tasks/:id/archive archives a task', async () => {
+  it('POST /tasks/:id/archive archives a task and preserves completedAt', async () => {
     const created = await createFixture({ title: '[test-tasks] Archive Me' });
+    const completed = await auth(request(app).post(`/tasks/${created.id}/complete`)).expect(200);
+    assert.ok(completed.body.completedAt);
 
     const archived = await auth(request(app).post(`/tasks/${created.id}/archive`)).expect(200);
     assert.equal(archived.body.status, 'ARCHIVED');
+    assert.equal(archived.body.completedAt, completed.body.completedAt);
+
+    // PATCH to ARCHIVED also preserves historical completedAt
+    const again = await createFixture({ title: '[test-tasks] Archive Via Patch' });
+    const done = await auth(request(app).post(`/tasks/${again.id}/complete`)).expect(200);
+    const patched = await auth(request(app).patch(`/tasks/${again.id}`))
+      .send({ status: 'ARCHIVED' })
+      .expect(200);
+    assert.equal(patched.body.status, 'ARCHIVED');
+    assert.equal(patched.body.completedAt, done.body.completedAt);
 
     await auth(request(app).post('/tasks/missing/archive')).expect(404);
+  });
+
+  it('rejects invalid contactId/conversationId without leaking Prisma details', async () => {
+    const logs = [];
+    const originalError = console.error;
+    console.error = (...args) => {
+      logs.push(args.map(String).join(' '));
+    };
+
+    try {
+      const badContact = await auth(request(app).post('/tasks'))
+        .send({
+          title: '[test-tasks] Bad Contact',
+          description: '[test-tasks] fk',
+          contactId: 'nonexistent-contact-id',
+        })
+        .expect(400);
+
+      assert.equal(badContact.body.error, 'Invalid contactId or conversationId');
+      assert.equal(Object.keys(badContact.body).join(','), 'error');
+      const bodyText = JSON.stringify(badContact.body);
+      assert.equal(bodyText.includes('Prisma'), false);
+      assert.equal(bodyText.includes('P2003'), false);
+      assert.equal(bodyText.includes('Foreign key'), false);
+      assert.equal(bodyText.includes('constraint'), false);
+
+      const badConversation = await auth(request(app).post('/tasks'))
+        .send({
+          title: '[test-tasks] Bad Conversation',
+          description: '[test-tasks] fk',
+          conversationId: 'nonexistent-conversation-id',
+        })
+        .expect(400);
+      assert.equal(badConversation.body.error, 'Invalid contactId or conversationId');
+
+      const created = await createFixture({ title: '[test-tasks] Patch Bad FK' });
+      const badPatch = await auth(request(app).patch(`/tasks/${created.id}`))
+        .send({ contactId: 'still-missing-contact' })
+        .expect(400);
+      assert.equal(badPatch.body.error, 'Invalid contactId or conversationId');
+
+      for (const line of logs) {
+        assert.equal(line.includes('Prisma'), false, `log leaked Prisma: ${line}`);
+        assert.equal(line.includes('P2003'), false, `log leaked P2003: ${line}`);
+        assert.equal(line.includes('Foreign key'), false, `log leaked FK detail: ${line}`);
+        assert.match(line, /invalid related id|database error/);
+      }
+    } finally {
+      console.error = originalError;
+    }
   });
 
   it('does not alter existing endpoints', async () => {
@@ -627,9 +745,11 @@ describe('Tasks API error paths', () => {
 
   it('returns 500 when list/get/create/update/complete/reopen/archive services fail', async () => {
     stubTaskFn('listTasks', async () => {
-      throw new Error('list boom');
+      throw new Error('list boom with Prisma Client details');
     });
-    await auth(request(app).get('/tasks')).expect(500);
+    const listRes = await auth(request(app).get('/tasks')).expect(500);
+    assert.equal(listRes.body.error, 'Failed to list tasks');
+    assert.equal(JSON.stringify(listRes.body).includes('Prisma'), false);
 
     stubTaskFn('getTaskById', async () => {
       throw 'get boom';
@@ -660,6 +780,39 @@ describe('Tasks API error paths', () => {
       throw new Error('archive boom');
     });
     await auth(request(app).post('/tasks/abc/archive')).expect(500);
+  });
+
+  it('returns 400 for foreign-key failures without leaking Prisma details', async () => {
+    const logs = [];
+    const originalError = console.error;
+    console.error = (...args) => {
+      logs.push(args.map(String).join(' '));
+    };
+
+    try {
+      stubTaskFn('createTask', async () => {
+        const err = new Error('Foreign key constraint violated on Contact');
+        err.code = 'P2003';
+        throw err;
+      });
+      const res = await auth(request(app).post('/tasks')).send({ title: 'X' }).expect(400);
+      assert.equal(res.body.error, 'Invalid contactId or conversationId');
+      assert.equal(JSON.stringify(res.body).includes('Prisma'), false);
+      assert.equal(JSON.stringify(res.body).includes('P2003'), false);
+      assert.equal(JSON.stringify(res.body).includes('Foreign key'), false);
+
+      stubTaskFn('updateTask', async () => {
+        const err = new Error('Foreign key constraint violated on Conversation');
+        err.code = 'P2003';
+        throw err;
+      });
+      await auth(request(app).patch('/tasks/abc')).send({ title: 'Y' }).expect(400);
+
+      assert.ok(logs.every((line) => !line.includes('P2003') && !line.includes('Foreign key')));
+      assert.ok(logs.some((line) => line.includes('invalid related id')));
+    } finally {
+      console.error = originalError;
+    }
   });
 
   it('returns 400 when task id params fail validation', async () => {

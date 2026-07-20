@@ -160,7 +160,7 @@ async function handleMeytalCommand(text) {
 }
 
 async function connectWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+ const { state, saveCreds } = await useMultiFileAuthState('/app/auth_info');
   sock = makeWASocket({
     auth: state,
     logger: pino({ level: 'silent' }),

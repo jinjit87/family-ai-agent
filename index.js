@@ -160,7 +160,10 @@ async function handleMeytalCommand(text) {
 }
 
 async function connectWhatsApp() {
- const { state, saveCreds } = await useMultiFileAuthState('/app/auth_info');
+  console.log('Starting WhatsApp connection...');
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState('/app/auth_info');
+    console.log('Auth state loaded');
   sock = makeWASocket({
     auth: state,
     logger: pino({ level: 'silent' }),
@@ -227,7 +230,10 @@ app.get('/morning', async (req, res) => {
   await sendToMeytal(`☀️ *Good morning Meytal!*\n\n${briefing}`);
   res.send('Morning briefing sent!');
 });
-
+} catch (err) {
+    console.error('WhatsApp connection error:', err.message);
+  }
+}
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);

@@ -91,6 +91,7 @@ describe('Baileys isolation', () => {
     const activeFiles = [
       'index.js',
       'lib/env.js',
+      'lib/db.js',
       'package.json',
     ];
 

@@ -1,6 +1,7 @@
 const express = require('express');
 const { google } = require('googleapis');
 const { loadEnv } = require('./lib/env');
+const { checkDatabaseHealth } = require('./lib/db');
 
 const SERVICE_NAME = 'family-ai-agent';
 const CALENDAR_READONLY_SCOPE = 'https://www.googleapis.com/auth/calendar.readonly';
@@ -122,6 +123,23 @@ function createApp(env) {
   app.get('/health', (_req, res) => {
     res.status(200).json({
       status: 'ok',
+      timestamp: new Date().toISOString(),
+      service: SERVICE_NAME,
+    });
+  });
+
+  // Database connectivity check (Phase 2). Does not alter /health.
+  // Public body never includes error details, connection strings, or credentials.
+  app.get('/health/db', async (_req, res) => {
+    const result = await checkDatabaseHealth();
+    if (!result.ok) {
+      // Generic only — never log DATABASE_URL, credentials, or raw driver errors.
+      console.error('Database health check failed');
+    }
+    return res.status(result.ok ? 200 : 503).json({
+      status: result.ok ? 'ok' : 'error',
+      database: result.ok ? 'up' : 'down',
+      latencyMs: result.latencyMs,
       timestamp: new Date().toISOString(),
       service: SERVICE_NAME,
     });

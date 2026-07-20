@@ -4,13 +4,13 @@ const fs = require('node:fs');
 const path = require('node:path');
 const request = require('supertest');
 
-const { createApp, loadEnv, SERVICE_NAME } = require('../index');
+const { createApp, loadEnv, SERVICE_NAME, createOAuthClient, CALENDAR_READONLY_SCOPE } = require('../index');
 
 const VALID_ENV = {
   ANTHROPIC_API_KEY: 'test-anthropic-key',
   GOOGLE_CLIENT_ID: 'test-google-client-id',
   GOOGLE_CLIENT_SECRET: 'test-google-client-secret',
-  GOOGLE_REDIRECT_URI: 'https://example.com/auth/callback',
+  GOOGLE_CALENDAR_REDIRECT_URI: 'https://example.com/auth/callback',
   ADMIN_API_KEY: 'test-admin-api-key',
 };
 
@@ -23,7 +23,7 @@ describe('environment validation', () => {
         assert.match(err.message, /ANTHROPIC_API_KEY/);
         assert.match(err.message, /GOOGLE_CLIENT_ID/);
         assert.match(err.message, /GOOGLE_CLIENT_SECRET/);
-        assert.match(err.message, /GOOGLE_REDIRECT_URI/);
+        assert.match(err.message, /GOOGLE_CALENDAR_REDIRECT_URI/);
         assert.match(err.message, /ADMIN_API_KEY/);
         // Never echo secret-like values (none were provided; ensure message has no key=value leaks).
         assert.doesNotMatch(err.message, /=/);
@@ -32,10 +32,52 @@ describe('environment validation', () => {
     );
   });
 
-  it('accepts a valid environment', () => {
+  it('accepts a valid environment with GOOGLE_CALENDAR_REDIRECT_URI', () => {
     const env = loadEnv(VALID_ENV);
     assert.equal(env.ADMIN_API_KEY, VALID_ENV.ADMIN_API_KEY);
-    assert.equal(env.GOOGLE_REDIRECT_URI, VALID_ENV.GOOGLE_REDIRECT_URI);
+    assert.equal(env.GOOGLE_CALENDAR_REDIRECT_URI, VALID_ENV.GOOGLE_CALENDAR_REDIRECT_URI);
+  });
+
+  it('accepts deprecated GOOGLE_REDIRECT_URI as Calendar-only fallback', () => {
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (msg) => warnings.push(String(msg));
+    try {
+      const env = loadEnv({
+        ANTHROPIC_API_KEY: 'test-anthropic-key',
+        GOOGLE_CLIENT_ID: 'test-google-client-id',
+        GOOGLE_CLIENT_SECRET: 'test-google-client-secret',
+        GOOGLE_REDIRECT_URI: 'https://example.com/auth/callback',
+        ADMIN_API_KEY: 'test-admin-api-key',
+      });
+      assert.equal(env.GOOGLE_CALENDAR_REDIRECT_URI, 'https://example.com/auth/callback');
+      assert.ok(warnings.some((w) => w.includes('DEPRECATED') && w.includes('GOOGLE_REDIRECT_URI')));
+      assert.ok(warnings.every((w) => !w.includes('https://example.com')));
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  it('Calendar OAuth client uses GOOGLE_CALENDAR_REDIRECT_URI only', () => {
+    const crypto = require('crypto');
+    const env = loadEnv({
+      ...VALID_ENV,
+      GOOGLE_CALENDAR_REDIRECT_URI: 'https://cal.example/auth/callback',
+      GOOGLE_GMAIL_REDIRECT_URI: 'https://gmail.example/gmail/callback',
+      TOKEN_ENCRYPTION_KEY: crypto.randomBytes(32).toString('hex'),
+      DATABASE_URL: 'postgresql://family_ai:family_ai_dev@localhost:5432/family_ai_agent?schema=public',
+    });
+    const client = createOAuthClient(env);
+    const url = client.generateAuthUrl({
+      access_type: 'offline',
+      scope: [CALENDAR_READONLY_SCOPE],
+    });
+    const redirect = new URL(url).searchParams.get('redirect_uri');
+    assert.equal(redirect, 'https://cal.example/auth/callback');
+    assert.notEqual(redirect, env.GOOGLE_GMAIL_REDIRECT_URI);
+    const scopes = (new URL(url).searchParams.get('scope') || '').split(/\s+/);
+    assert.ok(scopes.includes(CALENDAR_READONLY_SCOPE));
+    assert.ok(!scopes.some((s) => s.includes('gmail')));
   });
 });
 

@@ -28,19 +28,8 @@ function requireAdmin(env) {
 }
 
 function createOAuthClient(env) {
-  // Calendar OAuth uses /auth/callback. Gmail MVP sets GOOGLE_REDIRECT_URI to /gmail/callback.
-  // Derive the calendar redirect so both flows can share one Google OAuth client.
-  let redirectUri = env.GOOGLE_REDIRECT_URI;
-  try {
-    const url = new URL(env.GOOGLE_REDIRECT_URI);
-    if (url.pathname === '/gmail/callback' || url.pathname.endsWith('/gmail/callback')) {
-      url.pathname = '/auth/callback';
-      redirectUri = url.toString();
-    }
-  } catch (_e) {
-    // Keep configured URI if parsing fails.
-  }
-
+  // Calendar OAuth uses GOOGLE_CALENDAR_REDIRECT_URI only (never Gmail redirect).
+  const redirectUri = env.GOOGLE_CALENDAR_REDIRECT_URI;
   const oauth2Client = new google.auth.OAuth2(
     env.GOOGLE_CLIENT_ID,
     env.GOOGLE_CLIENT_SECRET,
@@ -282,6 +271,7 @@ module.exports = {
   createApp,
   loadEnv,
   requireAdmin,
+  createOAuthClient,
   SERVICE_NAME,
   CALENDAR_READONLY_SCOPE,
 };

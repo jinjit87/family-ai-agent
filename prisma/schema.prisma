@@ -383,6 +383,8 @@ model InboxAccount {
   // Gmail connector sync telemetry (safe messages only — never raw provider errors).
   syncStatus        String?
   lastSyncError     String?
+  // Lease-based sync lock. Null/expired = available. Survives process restart.
+  syncLockExpiresAt DateTime?
 
   items           InboxItem[]
   gmailCredential GmailCredential?
@@ -406,6 +408,19 @@ model GmailCredential {
   scopes                String
 
   inboxAccount InboxAccount @relation(fields: [inboxAccountId], references: [id], onDelete: Cascade)
+}
+
+// One-time Gmail OAuth CSRF state (signed nonce + DB consume tracking).
+model GmailOAuthState {
+  id         String    @id @default(cuid())
+  createdAt  DateTime  @default(now())
+  nonce      String    @unique
+  flow       String    // always "gmail" — cannot be reused for Calendar
+  expiresAt  DateTime
+  consumedAt DateTime?
+
+  @@index([expiresAt])
+  @@index([flow])
 }
 
 model InboxItem {

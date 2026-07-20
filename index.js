@@ -2,6 +2,7 @@ const express = require('express');
 const { google } = require('googleapis');
 const { loadEnv } = require('./lib/env');
 const { checkDatabaseHealth } = require('./lib/db');
+const { createContactsRouter } = require('./lib/contactsRouter');
 
 const SERVICE_NAME = 'family-ai-agent';
 const CALENDAR_READONLY_SCOPE = 'https://www.googleapis.com/auth/calendar.readonly';
@@ -209,6 +210,15 @@ function createApp(env) {
 
   // Explicitly reject the former public QR pairing route.
   app.all('/qr', (_req, res) => {
+    res.status(404).json({ error: 'Not found' });
+  });
+
+  // Phase 3: Contacts CRUD (additive — does not alter existing endpoints).
+  // Must be registered before the final catch-all 404 handler.
+  app.use('/contacts', createContactsRouter({ adminAuth }));
+
+  // Final catch-all — must remain the last route/middleware.
+  app.use((_req, res) => {
     res.status(404).json({ error: 'Not found' });
   });
 

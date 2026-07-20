@@ -92,6 +92,9 @@ describe('Baileys isolation', () => {
       'index.js',
       'lib/env.js',
       'lib/db.js',
+      'lib/contacts.js',
+      'lib/contactsSchemas.js',
+      'lib/contactsRouter.js',
       'package.json',
     ];
 

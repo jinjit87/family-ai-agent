@@ -1,30 +1,41 @@
 const express = require('express');
-const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const { google } = require('googleapis');
-const pino = require('pino');
-const QRCode = require('qrcode');
-const app = express();
-app.use(express.json());
+const { loadEnv } = require('./lib/env');
 
-const oauth2Client = new google.auth.OAuth2(
-  process.env.GOOGLE_CLIENT_ID,
-  process.env.GOOGLE_CLIENT_SECRET,
-  'https://web-production-a96f23.up.railway.app/auth/callback'
-);
-if (process.env.GOOGLE_REFRESH_TOKEN) {
-  oauth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
+const SERVICE_NAME = 'family-ai-agent';
+const CALENDAR_READONLY_SCOPE = 'https://www.googleapis.com/auth/calendar.readonly';
+
+function requireAdmin(env) {
+  return function adminAuth(req, res, next) {
+    const header = req.headers.authorization;
+    if (!header || typeof header !== 'string') {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const match = /^Bearer\s+(\S+)$/i.exec(header.trim());
+    if (!match || match[1] !== env.ADMIN_API_KEY) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    return next();
+  };
 }
 
-const pendingApprovals = new Map();
-let approvalCounter = 1;
-const MY_NUMBER = process.env.MY_PHONE_NUMBER + '@s.whatsapp.net';
-const MONITORED_GROUPS = process.env.MONITORED_GROUPS ?
-  process.env.MONITORED_GROUPS.split(',') : [];
+function createOAuthClient(env) {
+  const oauth2Client = new google.auth.OAuth2(
+    env.GOOGLE_CLIENT_ID,
+    env.GOOGLE_CLIENT_SECRET,
+    env.GOOGLE_REDIRECT_URI
+  );
 
-let sock;
-let latestQR = null;
+  if (env.GOOGLE_REFRESH_TOKEN) {
+    oauth2Client.setCredentials({ refresh_token: env.GOOGLE_REFRESH_TOKEN });
+  }
 
-async function getCalendarEvents() {
+  return oauth2Client;
+}
+
+async function getCalendarEvents(oauth2Client) {
   try {
     const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
     const now = new Date();
@@ -40,29 +51,31 @@ async function getCalendarEvents() {
           timeMax: end.toISOString(),
           singleEvents: true,
           orderBy: 'startTime',
-          q: kid
+          q: kid,
         });
-        const events = (res.data.items || []).map(e => ({
+        const events = (res.data.items || []).map((e) => ({
           kid,
           title: e.summary,
-          start: e.start.dateTime || e.start.date
+          start: e.start.dateTime || e.start.date,
         }));
         allEvents = allEvents.concat(events);
-      } catch (e) {}
+      } catch (_e) {
+        // Swallow per-kid failures; continue with remaining kids.
+      }
     }
     return allEvents;
-  } catch (e) {
+  } catch (_e) {
     return [];
   }
 }
 
-async function askAI(message, calendarContext = '') {
+async function askAI(apiKey, message, calendarContext = '') {
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
-      'x-api-key': process.env.ANTHROPIC_API_KEY,
+      'x-api-key': apiKey,
       'anthropic-version': '2023-06-01',
-      'Content-Type': 'application/json'
+      'Content-Type': 'application/json',
     },
     body: JSON.stringify({
       model: 'claude-sonnet-4-6',
@@ -89,162 +102,127 @@ When suggesting a reply, format it exactly like this:
 SUMMARY: [what the message is about in English]
 SUGGESTED REPLY: [your suggested reply]
 REASON: [why you suggest this]`,
-      messages: [{ role: 'user', content: message }]
-    })
+      messages: [{ role: 'user', content: message }],
+    }),
   });
   const data = await response.json();
   return data.content?.[0]?.text || 'Could not process this message.';
 }
 
-async function sendToMeytal(message) {
-  if (!sock) return;
-  await sock.sendMessage(MY_NUMBER, { text: message });
-}
+/**
+ * Build the Express app. WhatsApp/Baileys is intentionally not initialized.
+ */
+function createApp(env) {
+  const app = express();
+  app.use(express.json());
 
-async function createApproval(from, originalText, suggestion, isGroup = false) {
-  const id = approvalCounter++;
-  pendingApprovals.set(id.toString(), { from, originalText, suggestion, isGroup });
-  const parts = suggestion.split('\n');
-  const suggestedReply = parts.find(p => p.startsWith('SUGGESTED REPLY:'))?.replace('SUGGESTED REPLY:', '').trim();
-  const summary = parts.find(p => p.startsWith('SUMMARY:'))?.replace('SUMMARY:', '').trim();
-  let msg = `📨 *Message #${id}*\nFrom: ${isGroup ? 'Class group' : from}\n\n📝 *Summary:* ${summary || 'See original'}\n💬 *Original:* "${originalText}"`;
-  if (suggestedReply) {
-    msg += `\n\n✏️ *Suggested reply:*\n"${suggestedReply}"\n\nReply with:\n✅ *SEND ${id}*\n✏️ *EDIT ${id} your text*\n❌ *SKIP ${id}*`;
-  } else {
-    msg += `\n\nReply *OK ${id}* to acknowledge.`;
-  }
-  await sendToMeytal(msg);
-}
+  const oauth2Client = createOAuthClient(env);
+  const adminAuth = requireAdmin(env);
 
-async function handleMeytalCommand(text) {
-  const upper = text.toUpperCase().trim();
-  if (upper.startsWith('SEND ')) {
-    const id = upper.replace('SEND ', '').trim();
-    const approval = pendingApprovals.get(id);
-    if (!approval) return sendToMeytal(`❌ No pending message #${id}`);
-    const parts = approval.suggestion.split('\n');
-    const suggestedReply = parts.find(p => p.startsWith('SUGGESTED REPLY:'))?.replace('SUGGESTED REPLY:', '').trim();
-    if (suggestedReply && sock) {
-      await sock.sendMessage(approval.from, { text: suggestedReply });
-      pendingApprovals.delete(id);
-      await sendToMeytal(`✅ Reply sent for message #${id}`);
-    }
-    return;
-  }
-  if (upper.startsWith('EDIT ')) {
-    const rest = text.replace(/^EDIT /i, '').trim();
-    const spaceIdx = rest.indexOf(' ');
-    const id = rest.substring(0, spaceIdx);
-    const customReply = rest.substring(spaceIdx + 1).trim();
-    const approval = pendingApprovals.get(id);
-    if (!approval) return sendToMeytal(`❌ No pending message #${id}`);
-    if (sock) {
-      await sock.sendMessage(approval.from, { text: customReply });
-      pendingApprovals.delete(id);
-      await sendToMeytal(`✅ Your reply sent for message #${id}`);
-    }
-    return;
-  }
-  if (upper.startsWith('SKIP ') || upper.startsWith('OK ')) {
-    const id = upper.replace('SKIP ', '').replace('OK ', '').trim();
-    pendingApprovals.delete(id);
-    await sendToMeytal(`✅ Message #${id} skipped`);
-    return;
-  }
-  if (upper === 'LIST') {
-    if (pendingApprovals.size === 0) return sendToMeytal('✅ No pending messages!');
-    let list = `📋 *Pending (${pendingApprovals.size}):*\n`;
-    pendingApprovals.forEach((v, k) => { list += `\n#${k}: "${v.originalText.substring(0, 50)}..."`; });
-    await sendToMeytal(list);
-  }
-}
-
-async function connectWhatsApp() {
-  console.log('Starting WhatsApp connection...');
-  const { state, saveCreds } = await useMultiFileAuthState('/app/auth_info');
-  console.log('Auth state loaded');
-
-  sock = makeWASocket({
-    auth: state,
-    logger: pino({ level: 'silent' }),
-    printQRInTerminal: false
+  app.get('/health', (_req, res) => {
+    res.status(200).json({
+      status: 'ok',
+      timestamp: new Date().toISOString(),
+      service: SERVICE_NAME,
+    });
   });
 
-  sock.ev.on('creds.update', saveCreds);
-
- sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-    if (qr) {
-      latestQR = qr;
-      console.log('QR CODE RECEIVED - length:', qr.length);
-    }
-    if (connection === 'close') {
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      if (shouldReconnect) connectWhatsApp();
-    }
-    if (connection === 'open') {
-      latestQR = null;
-      console.log('WhatsApp connected!');
-      await sendToMeytal('✅ *Meytal OS is online!*\n\nCommands:\n• *SEND {id}* — approve reply\n• *EDIT {id} your text* — send your own reply\n• *SKIP {id}* — ignore\n• *LIST* — see pending');
-    }
+  // Operational: start Google OAuth (Calendar readonly only).
+  app.get('/auth', adminAuth, (_req, res) => {
+    const url = oauth2Client.generateAuthUrl({
+      access_type: 'offline',
+      prompt: 'consent',
+      scope: [CALENDAR_READONLY_SCOPE],
+    });
+    res.redirect(url);
   });
 
-  sock.ev.on('messages.upsert', async ({ messages }) => {
-    for (const message of messages) {
-      if (message.key.fromMe) continue;
-      const from = message.key.remoteJid;
-      const isGroup = from.endsWith('@g.us');
-      const text = message.message?.conversation || message.message?.extendedTextMessage?.text || '';
-      if (!text) continue;
-      if (from === MY_NUMBER) { await handleMeytalCommand(text); continue; }
-      const events = await getCalendarEvents();
-      const calendarContext = events.map(e => `${e.kid}: ${e.title} on ${e.start}`).join('\n');
-      if (isGroup) {
-        if (MONITORED_GROUPS.length > 0 && !MONITORED_GROUPS.includes(from)) continue;
-        const analysis = await askAI(`Group message: "${text}"\n\nIs this important for a parent? Translate and summarize in English. If not important, reply with just IGNORE.`, calendarContext);
-        if (!analysis.includes('IGNORE')) await sendToMeytal(`📢 *Class group alert:*\n${analysis}`);
-        continue;
+  // Google OAuth callback — must remain reachable without Bearer auth.
+  // Never log or return token/code values.
+  app.get('/auth/callback', async (req, res) => {
+    try {
+      const code = req.query.code;
+      if (!code || typeof code !== 'string') {
+        return res.status(400).send('Google authorization failed.');
       }
-      const analysis = await askAI(`Direct message from ${from}: "${text}"\n\nAnalyze and draft a reply if needed. Use ONLY the calendar data provided.`, calendarContext);
-      await createApproval(from, text, analysis, false);
+
+      const { tokens } = await oauth2Client.getToken(code);
+      oauth2Client.setCredentials(tokens);
+
+      if (tokens.refresh_token) {
+        return res
+          .status(200)
+          .send(
+            'Google connected. A refresh token was issued — store GOOGLE_REFRESH_TOKEN in your host environment (never commit it). This page does not display token values.'
+          );
+      }
+
+      return res
+        .status(200)
+        .send('Google connected. No new refresh token was returned (an existing one may already be stored).');
+    } catch (_err) {
+      return res.status(400).send('Google authorization failed.');
     }
   });
+
+  // Operational: morning briefing. WhatsApp delivery is disabled in Phase 1.
+  app.get('/morning', adminAuth, async (_req, res) => {
+    try {
+      const events = await getCalendarEvents(oauth2Client);
+      const calendarContext =
+        events.length > 0
+          ? events.map((e) => `${e.kid}: ${e.title} on ${e.start}`).join('\n')
+          : 'No events found.';
+      const briefing = await askAI(
+        env.ANTHROPIC_API_KEY,
+        'Generate a morning briefing for Meytal based ONLY on the real calendar events provided. Do not invent any events.',
+        calendarContext
+      );
+
+      return res.status(200).json({
+        status: 'ok',
+        whatsappDelivery: 'disabled',
+        briefing,
+      });
+    } catch (_err) {
+      return res.status(500).json({ error: 'Failed to generate morning briefing' });
+    }
+  });
+
+  // Explicitly reject the former public QR pairing route.
+  app.all('/qr', (_req, res) => {
+    res.status(404).json({ error: 'Not found' });
+  });
+
+  return app;
 }
 
-app.get('/qr', async (req, res) => {
-  if (!latestQR) return res.send('<h2>✅ WhatsApp already connected!</h2>');
-  const qrImage = await QRCode.toDataURL(latestQR);
-  res.send(`<html><body style="text-align:center;font-family:sans-serif;padding:40px"><h1>Scan with WhatsApp</h1><p>WhatsApp → Settings → Linked Devices → Link a Device</p><img src="${qrImage}" style="width:300px"/><p><a href="/qr">Refresh</a></p></body></html>`);
-});
+function startServer() {
+  const env = loadEnv();
+  const app = createApp(env);
+  const port = Number(env.PORT) || 3000;
 
-app.get('/auth', (req, res) => {
-  const url = oauth2Client.generateAuthUrl({
-    access_type: 'offline',
-    scope: ['https://www.googleapis.com/auth/calendar', 'https://www.googleapis.com/auth/gmail.modify']
+  app.listen(port, () => {
+    console.log(`Server running on port ${port}`);
+    console.log('WhatsApp automation is disabled; unofficial Web client is not started.');
   });
-  res.redirect(url);
-});
 
-app.get('/auth/callback', async (req, res) => {
-  const { code } = req.query;
-  const { tokens } = await oauth2Client.getToken(code);
-  oauth2Client.setCredentials(tokens);
-  console.log('SAVE THIS REFRESH TOKEN:', tokens.refresh_token);
-  res.send('Google connected!');
-});
+  return app;
+}
 
-app.get('/morning', async (req, res) => {
-  const events = await getCalendarEvents();
-  const calendarContext = events.length > 0 ? events.map(e => `${e.kid}: ${e.title} on ${e.start}`).join('\n') : 'No events found.';
-  const briefing = await askAI('Generate a morning briefing for Meytal based ONLY on the real calendar events provided. Do not invent any events.', calendarContext);
-  await sendToMeytal(`☀️ *Good morning Meytal!*\n\n${briefing}`);
-  res.send('Morning briefing sent!');
-});
+if (require.main === module) {
+  try {
+    startServer();
+  } catch (err) {
+    console.error(err.message);
+    process.exit(1);
+  }
+}
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, async () => {
-  console.log(`Server running on port ${PORT}`);
-  await connectWhatsApp();
-});
-
-module.exports = app;
+module.exports = {
+  createApp,
+  loadEnv,
+  requireAdmin,
+  SERVICE_NAME,
+  CALENDAR_READONLY_SCOPE,
+};

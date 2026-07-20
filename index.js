@@ -161,27 +161,34 @@ async function handleMeytalCommand(text) {
 
 async function connectWhatsApp() {
   console.log('Starting WhatsApp connection...');
-  try {
-    const { state, saveCreds } = await useMultiFileAuthState('/app/auth_info');
-    console.log('Auth state loaded');
+  const { state, saveCreds } = await useMultiFileAuthState('/app/auth_info');
+  console.log('Auth state loaded');
+
   sock = makeWASocket({
     auth: state,
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false
   });
+
   sock.ev.on('creds.update', saveCreds);
+
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
-    if (qr) { latestQR = qr; console.log('QR ready — visit /qr'); }
+    if (qr) {
+      latestQR = qr;
+      console.log('QR ready — visit /qr');
+    }
     if (connection === 'close') {
       const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
       if (shouldReconnect) connectWhatsApp();
     }
     if (connection === 'open') {
       latestQR = null;
+      console.log('WhatsApp connected!');
       await sendToMeytal('✅ *Meytal OS is online!*\n\nCommands:\n• *SEND {id}* — approve reply\n• *EDIT {id} your text* — send your own reply\n• *SKIP {id}* — ignore\n• *LIST* — see pending');
     }
   });
+
   sock.ev.on('messages.upsert', async ({ messages }) => {
     for (const message of messages) {
       if (message.key.fromMe) continue;
@@ -211,7 +218,10 @@ app.get('/qr', async (req, res) => {
 });
 
 app.get('/auth', (req, res) => {
-  const url = oauth2Client.generateAuthUrl({ access_type: 'offline', scope: ['https://www.googleapis.com/auth/calendar', 'https://www.googleapis.com/auth/gmail.modify'] });
+  const url = oauth2Client.generateAuthUrl({
+    access_type: 'offline',
+    scope: ['https://www.googleapis.com/auth/calendar', 'https://www.googleapis.com/auth/gmail.modify']
+  });
   res.redirect(url);
 });
 
@@ -230,10 +240,7 @@ app.get('/morning', async (req, res) => {
   await sendToMeytal(`☀️ *Good morning Meytal!*\n\n${briefing}`);
   res.send('Morning briefing sent!');
 });
-} catch (err) {
-    console.error('WhatsApp connection error:', err.message);
-  }
-}
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);

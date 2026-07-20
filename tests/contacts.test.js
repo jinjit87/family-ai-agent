@@ -2,20 +2,28 @@ const { describe, it, before, after, beforeEach, afterEach } = require('node:tes
 const assert = require('node:assert/strict');
 const request = require('supertest');
 
-const { createApp, loadEnv } = require('../index');
+const express = require('express');
+const { createApp, loadEnv, requireAdmin } = require('../index');
 const { getPrisma, disconnectPrisma } = require('../lib/db');
 const {
   createContactSchema,
   updateContactSchema,
   listContactsQuerySchema,
+  contactIdParamSchema,
   formatZodError,
 } = require('../lib/contactsSchemas');
+const contacts = require('../lib/contacts');
+const schemas = require('../lib/contactsSchemas');
+const { createContactsRouter } = require('../lib/contactsRouter');
 const {
   buildSearchWhere,
   buildOrderBy,
   serializeContact,
   softDeleteContact,
-} = require('../lib/contacts');
+  createContact,
+  listContacts,
+  updateContact,
+} = contacts;
 
 const VALID_ENV = {
   ANTHROPIC_API_KEY: 'test-anthropic-key',
@@ -136,6 +144,11 @@ describe('contacts helpers', () => {
       deletedAt: now,
     });
     assert.equal(deleted.deletedAt, '2026-07-20T12:00:00.000Z');
+  });
+
+  it('contactIdParamSchema rejects empty ids', () => {
+    assert.equal(contactIdParamSchema.safeParse({ id: '' }).success, false);
+    assert.equal(contactIdParamSchema.safeParse({ id: 'abc' }).success, true);
   });
 });
 
@@ -401,5 +414,106 @@ describe('Contacts API', () => {
 
     await request(app).get('/qr').expect(404);
     await request(app).get('/morning').expect(401);
+  });
+
+  it('creates with defaults when only name is provided', async () => {
+    const created = await createContact({ name: 'Minimal Contact' });
+    createdIds.push(created.id);
+    assert.equal(created.name, 'Minimal Contact');
+    assert.equal(created.phone, null);
+    assert.equal(created.email, null);
+    assert.equal(created.company, null);
+    assert.equal(created.role, 'OTHER');
+    assert.equal(created.notes, null);
+
+    // Tag for cleanup helpers that filter test rows.
+    await updateContact(created.id, { notes: '[test-contacts] minimal', email: 'minimal@contacts-test.example' });
+  });
+
+  it('listContacts falls back for unknown sort and reports empty pages', async () => {
+    const empty = await listContacts({
+      q: 'zzzz-no-match-contacts-test',
+      page: 1,
+      limit: 10,
+      sort: 'not-a-real-sort',
+    });
+    assert.equal(empty.pagination.total, 0);
+    assert.equal(empty.pagination.totalPages, 0);
+    assert.deepEqual(empty.data, []);
+  });
+
+  it('updateContact returns null for missing ids', async () => {
+    const missing = await updateContact('missing-contact-id', { name: 'Nope' });
+    assert.equal(missing, null);
+  });
+});
+
+describe('Contacts API error paths', () => {
+  let app;
+  const originals = {};
+
+  before(() => {
+    process.env.DATABASE_URL = DATABASE_URL;
+    const env = loadEnv(VALID_ENV);
+    app = express();
+    app.use(express.json());
+    app.use('/contacts', createContactsRouter({ adminAuth: requireAdmin(env) }));
+  });
+
+  afterEach(() => {
+    for (const key of Object.keys(originals)) {
+      if (key === 'safeParseId') {
+        schemas.contactIdParamSchema.safeParse = originals.safeParseId;
+      } else {
+        contacts[key] = originals[key];
+      }
+      delete originals[key];
+    }
+  });
+
+  function stubContactFn(name, impl) {
+    if (!(name in originals)) {
+      originals[name] = contacts[name];
+    }
+    contacts[name] = impl;
+  }
+
+  it('returns 500 when list/get/create/update/delete services fail', async () => {
+    stubContactFn('listContacts', async () => {
+      throw new Error('list boom');
+    });
+    await auth(request(app).get('/contacts')).expect(500);
+
+    stubContactFn('getContactById', async () => {
+      throw 'get boom';
+    });
+    await auth(request(app).get('/contacts/abc')).expect(500);
+
+    stubContactFn('createContact', async () => {
+      throw new Error('create boom');
+    });
+    await auth(request(app).post('/contacts')).send({ name: 'X' }).expect(500);
+
+    stubContactFn('updateContact', async () => {
+      throw new Error('update boom');
+    });
+    await auth(request(app).patch('/contacts/abc')).send({ name: 'Y' }).expect(500);
+
+    stubContactFn('softDeleteContact', async () => {
+      throw new Error('delete boom');
+    });
+    await auth(request(app).delete('/contacts/abc')).expect(500);
+  });
+
+  it('returns 400 when contact id params fail validation', async () => {
+    originals.safeParseId = schemas.contactIdParamSchema.safeParse;
+    schemas.contactIdParamSchema.safeParse = () => ({
+      success: false,
+      error: createContactSchema.safeParse({}).error,
+    });
+
+    await auth(request(app).get('/contacts/abc')).expect(400);
+    await auth(request(app).patch('/contacts/abc')).send({ name: 'Y' }).expect(400);
+    await auth(request(app).delete('/contacts/abc')).expect(400);
   });
 });

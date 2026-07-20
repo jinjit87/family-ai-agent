@@ -12,6 +12,7 @@ Family AI assistant for calendar-aware briefings (Anthropic + Google Calendar).
 - **Tasks API:** task management over Prisma `Task` (Phase 4)
 - **Payments API:** payments due engine over Prisma `Payment` (Phase 5)
 - **Inbox API:** multi-account AI inbox pipeline over Prisma `InboxAccount` / `InboxItem` (Phase 6)
+- **Gmail connector:** multi-account Google OAuth + encrypted tokens + manual sync (MVP)
 - **Auth:** shared admin secret (`ADMIN_API_KEY`) for operational HTTP routes
 - **Hosting:** Railway-compatible (`Procfile`, `PORT`)
 
@@ -19,7 +20,7 @@ Family AI assistant for calendar-aware briefings (Anthropic + Google Calendar).
 HTTP
  ├── GET /health                 public
  ├── GET /health/db              public → PostgreSQL connectivity
- ├── GET /auth                   admin Bearer required → Google OAuth
+ ├── GET /auth                   admin Bearer required → Google OAuth (Calendar)
  ├── GET /auth/callback          Google redirect (no tokens in response/logs)
  ├── GET /morning                admin Bearer required → AI briefing (JSON)
  ├── GET /contacts               admin Bearer required → list/search contacts
@@ -56,7 +57,13 @@ HTTP
  ├── PATCH /inbox/:id            admin Bearer required → update inbox item
  ├── POST /inbox/:id/analyze     admin Bearer required → mock AI analysis
  ├── POST /inbox/:id/archive     admin Bearer required → archive inbox item
- └── POST /inbox/:id/*-suggestions/:suggestionId/{approve|reject|apply}
+ ├── POST /inbox/:id/*-suggestions/:suggestionId/{approve|reject|apply}
+ ├── GET /gmail/connect          admin Bearer required → start Gmail OAuth (no Bearer in browser URL)
+ ├── GET /gmail/callback         public Google redirect → save encrypted credentials
+ ├── GET /gmail/accounts         admin Bearer required → list connected Gmail accounts
+ ├── POST /gmail/accounts/:id/disconnect admin Bearer required → remove credentials, deactivate
+ ├── POST /gmail/accounts/:id/sync admin Bearer required → manual sync one account
+ └── POST /gmail/sync-all        admin Bearer required → manual sync all active Gmail accounts
 ```
 
 ## WhatsApp status (disabled)
@@ -98,14 +105,22 @@ Create a local `.env` file (never commit it), or export variables in your shell.
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `ANTHROPIC_API_KEY` | yes | Anthropic API key |
-| `GOOGLE_CLIENT_ID` | yes | Google OAuth client ID |
+| `GOOGLE_CLIENT_ID` | yes | Google OAuth client ID (shared web client for Calendar + Gmail) |
 | `GOOGLE_CLIENT_SECRET` | yes | Google OAuth client secret |
-| `GOOGLE_REDIRECT_URI` | yes | Must match the authorized redirect URI in Google Cloud (e.g. `https://YOUR_HOST/auth/callback` or `http://localhost:3000/auth/callback`) |
+| `GOOGLE_CALENDAR_REDIRECT_URI` | yes* | Calendar OAuth callback. Production: `https://web-production-2a12a.up.railway.app/auth/callback` |
+| `GOOGLE_GMAIL_REDIRECT_URI` | when Gmail enabled | Gmail OAuth callback. Production: `https://web-production-2a12a.up.railway.app/gmail/callback` |
 | `ADMIN_API_KEY` | yes | Shared secret for operational endpoints |
-| `GOOGLE_REFRESH_TOKEN` | no | Offline refresh token for Calendar access |
+| `TOKEN_ENCRYPTION_KEY` | when Gmail enabled | Exactly 32 bytes as **64-character hex** (`openssl rand -hex 32`). Validated at startup when Gmail is enabled; never log or print |
+| `GOOGLE_REFRESH_TOKEN` | no | Offline refresh token for Calendar access (separate from per-account Gmail tokens) |
 | `PORT` | no | Listen port (default `3000`) |
 | `MY_WHATSAPP` | no | Reserved; unused while WhatsApp is disabled |
-| `DATABASE_URL` | no* | PostgreSQL connection string (`postgresql://...`). Optional for app startup; required for migrations, seeds, Contacts/Tasks/Payments/Inbox APIs, and `/health/db` to report healthy |
+| `DATABASE_URL` | no* | PostgreSQL URL. Optional for bare app startup; **required when Gmail is enabled**, and for migrations/seeds/Inbox APIs/`/health/db` |
+| `GOOGLE_REDIRECT_URI` | deprecated | Temporary **Calendar-only** fallback if `GOOGLE_CALENDAR_REDIRECT_URI` is unset. Never used for Gmail. Remove after migrating all environments |
+
+\* Calendar redirect: set `GOOGLE_CALENDAR_REDIRECT_URI` (preferred) or temporarily `GOOGLE_REDIRECT_URI`. Gmail is fail-closed: if either `TOKEN_ENCRYPTION_KEY` or `GOOGLE_GMAIL_REDIRECT_URI` is set, **all** of `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_GMAIL_REDIRECT_URI`, `TOKEN_ENCRYPTION_KEY`, and `DATABASE_URL` are required.
+
+Add **both** callback URIs to the same Google OAuth web client when using Calendar and Gmail.
+
 
 ### Run
 
@@ -113,16 +128,18 @@ Create a local `.env` file (never commit it), or export variables in your shell.
 export ANTHROPIC_API_KEY=...
 export GOOGLE_CLIENT_ID=...
 export GOOGLE_CLIENT_SECRET=...
-export GOOGLE_REDIRECT_URI=http://localhost:3000/auth/callback
+export GOOGLE_CALENDAR_REDIRECT_URI=http://localhost:3000/auth/callback
+export GOOGLE_GMAIL_REDIRECT_URI=http://localhost:3000/gmail/callback
 export ADMIN_API_KEY=...
+export TOKEN_ENCRYPTION_KEY=$(openssl rand -hex 32)
 export DATABASE_URL="postgresql://USER:PASSWORD@localhost:5432/family_ai_agent?schema=public"
-# optional after first OAuth:
+# optional after first Calendar OAuth:
 # export GOOGLE_REFRESH_TOKEN=...
 
 npm start
 ```
 
-Startup fails with a clear list of **missing variable names** if required env is incomplete. Values are never printed.
+Startup fails with a clear list of **missing or invalid variable names** only (values are never printed). When Gmail is enabled, `TOKEN_ENCRYPTION_KEY` must be exactly 32 decoded bytes (documented format: 64-char hex).
 
 ### Tests
 
@@ -131,18 +148,21 @@ export DATABASE_URL="postgresql://USER:PASSWORD@localhost:5432/family_ai_agent?s
 npm test
 ```
 
-Contacts, Tasks, Payments, and Inbox module coverage (target >95%):
+Contacts, Tasks, Payments, Inbox, and Gmail tests:
 
 ```bash
+npm run test:inbox
+npm run test:gmail
 npm run test:coverage
 npm run test:coverage:tasks
 npm run test:coverage:payments
 npm run test:coverage:inbox
+npm run test:coverage:gmail
 ```
 
 ## Database (Phase 2 foundation)
 
-Prisma models: `Contact`, `Conversation`, `Message`, `Task`, `CalendarProposal`, `Approval`, `Rule`, `AuditLog`, `Payment`, `InboxAccount`, `InboxItem`, `InboxTaskSuggestion`, `InboxPaymentSuggestion`, `InboxReplySuggestion`.
+Prisma models: `Contact`, `Conversation`, `Message`, `Task`, `CalendarProposal`, `Approval`, `Rule`, `AuditLog`, `Payment`, `InboxAccount`, `InboxItem`, `InboxTaskSuggestion`, `InboxPaymentSuggestion`, `InboxReplySuggestion`, `GmailCredential`, `GmailOAuthState`.
 
 Phase 2 added the schema, migrations, seed data, and `GET /health/db`. The Contacts HTTP API is Phase 3. The Tasks API is Phase 4. The Payments Due Engine is Phase 5. The Multi-Inbox AI Inbox is Phase 6 (below). WhatsApp is not integrated.
 
@@ -643,13 +663,18 @@ Authorization: Bearer <ADMIN_API_KEY>
 
 ### Sync cursor behavior
 
-Gmail OAuth and polling are **not** implemented yet. Sync uses clean provider interfaces:
+Gmail OAuth and **manual sync** are implemented (MVP). Each Gmail account keeps an independent `syncCursor` (Gmail `historyId`) and `lastSyncedAt`.
 
-- `listNewMessages(account, cursor)`
-- `fetchMessage(account, externalId)`
-- `saveSyncCursor(account, cursor)`
+- Initial sync fetches up to the 50 most recent messages (`-in:spam -in:trash`).
+- Later syncs use Gmail History to fetch only new messages.
+- The cursor advances **only after** all fetched messages are successfully ingested (duplicates are idempotent skips).
+- A partial failure leaves the cursor unchanged.
+- Concurrent syncs for the same account return `409` with `code: SYNC_IN_PROGRESS` (DB lease lock with expiry so a crashed process cannot leave a permanent lock).
+- Spam and Trash are never ingested.
+- Stored bodies are sanitized (HTML scripts/styles/images/tracking stripped) and capped at 100,000 characters.
+- OAuth tokens are stored encrypted in `GmailCredential` (never on `InboxAccount`, never in API responses/logs).
 
-Each account keeps its own cursor. Stub providers return empty message lists until real connectors are wired. Saving a cursor updates `syncCursor` and `lastSyncedAt` for that account only.
+Stub sync providers remain for non-Gmail sources.
 
 ### Suggestion approval workflow
 
@@ -734,20 +759,118 @@ Same approve/reject/apply paths exist for `payment-suggestions` and `reply-sugge
 
 Mock analysis returns `{ summary, urgency, confidence, suggestedTasks, suggestedPayments, suggestedReplies }` with per-suggestion `confidence`, `reason`, and `evidence`.
 
+## Gmail connector (MVP)
+
+Connect one or more real Gmail accounts to the multi-inbox system. Tokens are encrypted at rest with `TOKEN_ENCRYPTION_KEY`. Sync is **manual** for this MVP (no Redis/queues/background workers).
+
+### Google Cloud setup
+
+1. Open [Google Cloud Console](https://console.cloud.google.com/) → APIs & Services.
+2. Enable **Gmail API** (and Calendar API if you still use `/morning`).
+3. Configure the **OAuth consent screen** (External or Internal). Add scopes:
+   - `https://www.googleapis.com/auth/gmail.readonly`
+   - `https://www.googleapis.com/auth/userinfo.email`
+   - `openid`
+   - (optional, Calendar) `https://www.googleapis.com/auth/calendar.readonly`
+4. Create an **OAuth 2.0 Client ID** (Web application).
+5. Under **Authorized redirect URIs**, add **exactly** (both required if using Calendar and Gmail):
+   - Production Calendar: `https://web-production-2a12a.up.railway.app/auth/callback`
+   - Production Gmail: `https://web-production-2a12a.up.railway.app/gmail/callback`
+   - Local Calendar: `http://localhost:3000/auth/callback`
+   - Local Gmail: `http://localhost:3000/gmail/callback`
+6. Copy the client ID and client secret into Railway / local env (never commit them).
+
+### Railway variables (exact)
+
+Set these on the Railway app service:
+
+| Variable | Example / notes |
+|----------|-----------------|
+| `GOOGLE_CLIENT_ID` | from Google Cloud OAuth client |
+| `GOOGLE_CLIENT_SECRET` | from Google Cloud OAuth client |
+| `GOOGLE_CALENDAR_REDIRECT_URI` | `https://web-production-2a12a.up.railway.app/auth/callback` |
+| `GOOGLE_GMAIL_REDIRECT_URI` | `https://web-production-2a12a.up.railway.app/gmail/callback` |
+| `TOKEN_ENCRYPTION_KEY` | `openssl rand -hex 32` (store once; rotating it invalidates stored Gmail tokens) |
+| `ADMIN_API_KEY` | long random secret |
+| `ANTHROPIC_API_KEY` | existing |
+| `DATABASE_URL` | from Railway Postgres plugin (required for Gmail) |
+| `GOOGLE_REFRESH_TOKEN` | optional; Calendar only |
+| `PORT` | usually injected by Railway |
+
+Do **not** set `GOOGLE_REDIRECT_URI` on new environments. If an old deploy still has it, migrate to `GOOGLE_CALENDAR_REDIRECT_URI` and remove the legacy variable (temporary Calendar-only fallback; planned removal).
+
+Prisma migrations run via the existing Railway pre-deploy command (`npm run db:migrate` / `prisma migrate deploy`). Do **not** run production migrations manually before merge.
+
+### Connect the first Gmail account
+
+```bash
+# 1) Get an authorization URL (Bearer stays in the API client — never put it in a browser URL)
+curl -s -H "Authorization: Bearer $ADMIN_API_KEY" \
+  -H "Accept: application/json" \
+  "https://web-production-2a12a.up.railway.app/gmail/connect?format=json"
+# → { "authorizationUrl": "https://accounts.google.com/..." }
+
+# 2) Open authorizationUrl in a browser, complete Google consent
+
+# 3) Google redirects to /gmail/callback — you should see "Gmail connected"
+
+# 4) Confirm the account
+curl -H "Authorization: Bearer $ADMIN_API_KEY" \
+  https://web-production-2a12a.up.railway.app/gmail/accounts
+```
+
+### Connect additional Gmail accounts
+
+Repeat the same `/gmail/connect` flow while signed into a **different** Google account in the browser (or use an incognito window). Each distinct Google identity creates a separate `InboxAccount` (`source=GMAIL`) with its own encrypted credentials and sync cursor. Re-authorizing the same Google user updates that account instead of creating a duplicate.
+
+### Manually sync
+
+```bash
+# One account
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
+  https://web-production-2a12a.up.railway.app/gmail/accounts/:id/sync
+
+# All active Gmail accounts
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
+  https://web-production-2a12a.up.railway.app/gmail/sync-all
+```
+
+Synced messages appear as `InboxItem` rows with `status=NEW`, `source=GMAIL`. Tasks/Payments are **not** auto-created — use `POST /inbox/:id/analyze` and the existing suggestion approve/apply flow.
+
+### Reconnect a revoked account
+
+If Google revokes access, sync returns `409` with `code: RECONNECT_REQUIRED`. Existing inbox items are kept. Re-run `/gmail/connect` for that Google user to store new credentials (same `externalAccountId` updates the account). Or disconnect first:
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
+  https://web-production-2a12a.up.railway.app/gmail/accounts/:id/disconnect
+```
+
+Disconnect deletes stored credentials and sets `isActive=false`; inbox items remain.
+
+### Security rules (Gmail)
+
+- Admin Bearer on `/gmail/connect`, `/gmail/accounts`, sync, and disconnect — **never** as a query param or in the browser redirect URL.
+- `/gmail/callback` is public but CSRF-protected via signed, DB-backed one-time `state` (10-minute TTL, bound to the Gmail flow).
+- Tokens encrypted with AES-256-GCM (`TOKEN_ENCRYPTION_KEY`); never logged or returned by APIs.
+- Safe errors only (`400` / `401` / `404` / `409` / `503`) — no raw Google errors, stack traces, or provider query parameters echoed to clients.
+
 ## Railway environment variables
 
-Set the same variables in the Railway project:
+Set these in the Railway project:
 
 - `ANTHROPIC_API_KEY`
 - `GOOGLE_CLIENT_ID`
 - `GOOGLE_CLIENT_SECRET`
-- `GOOGLE_REDIRECT_URI` — use your Railway public URL, e.g. `https://YOUR_SERVICE.up.railway.app/auth/callback`
+- `GOOGLE_CALENDAR_REDIRECT_URI` — `https://web-production-2a12a.up.railway.app/auth/callback`
+- `GOOGLE_GMAIL_REDIRECT_URI` — `https://web-production-2a12a.up.railway.app/gmail/callback`
+- `TOKEN_ENCRYPTION_KEY` — 64-char hex (`openssl rand -hex 32`)
 - `ADMIN_API_KEY` — long random secret
-- `GOOGLE_REFRESH_TOKEN` — after completing `/auth` once
+- `GOOGLE_REFRESH_TOKEN` — after completing `/auth` once (Calendar)
 - `PORT` — usually injected by Railway
-- `DATABASE_URL` — from the Railway PostgreSQL plugin (required for DB features and Contacts/Tasks/Payments/Inbox APIs)
+- `DATABASE_URL` — from the Railway PostgreSQL plugin
 
-Also add the same redirect URI in Google Cloud Console → OAuth client → Authorized redirect URIs.
+Add **both** redirect URIs in Google Cloud Console → OAuth client → Authorized redirect URIs when using Calendar and Gmail together.
 
 ## Calling protected endpoints
 
@@ -798,22 +921,27 @@ See [Multi-Inbox AI Inbox (Phase 6)](#multi-inbox-ai-inbox-phase-6) above.
 
 ## Google OAuth scopes
 
-Only:
+Gmail connector requests **only**:
+
+- `openid`
+- `https://www.googleapis.com/auth/userinfo.email`
+- `https://www.googleapis.com/auth/gmail.readonly`
+
+Gmail must **not** request `gmail.modify`, `gmail.send`, `mail.google.com`, or Calendar scopes.
+
+Calendar (`/auth`) requests **only**:
 
 - `https://www.googleapis.com/auth/calendar.readonly`
 
-Gmail scopes are not requested.
-
 ## Manual follow-ups after deploy
 
-1. Set all required Railway env vars (including a new `ADMIN_API_KEY` and `GOOGLE_REDIRECT_URI`).
-2. Complete `/auth` once and save `GOOGLE_REFRESH_TOKEN` if issued.
-3. Rotate any Google refresh token that may appear in older Railway logs.
-4. Delete any leftover `/app/auth_info` Baileys session files on the host and unlink the device in WhatsApp if it was previously paired.
-5. Confirm `/qr` returns 404 and `/morning` returns 401 without a Bearer token.
-6. Run `npx prisma migrate deploy` (or `npm run db:migrate`) so Postgres matches the schema, then optionally `npm run db:seed`.
-7. Confirm `/health/db` returns `"database":"up"`.
-8. Confirm Contacts CRUD works with a Bearer token (list/create/get/patch/soft-delete).
-9. Confirm Tasks API works with a Bearer token (list/create/get/patch/complete/reopen/archive).
-10. Confirm Payments Due Engine works with a Bearer token (list/create/get/patch/approve/mark-paid/reopen/archive/soft-delete and weekly report).
-11. Confirm Multi-Inbox AI Inbox works with a Bearer token (accounts, ingest, list without rawContent, analyze, suggestion approve/apply).
+1. Set Railway vars: `GOOGLE_CALENDAR_REDIRECT_URI`, `GOOGLE_GMAIL_REDIRECT_URI`, `TOKEN_ENCRYPTION_KEY`, `ADMIN_API_KEY`, and existing Anthropic/Google/DB keys. Remove deprecated `GOOGLE_REDIRECT_URI` if present.
+2. Confirm Google Cloud authorized redirect URIs include both `/auth/callback` and `/gmail/callback` production URLs.
+3. Complete `/gmail/connect` for the first Gmail account; confirm `/gmail/accounts` lists it.
+4. Run `POST /gmail/accounts/:id/sync` and confirm `InboxItem` rows appear as `NEW`.
+5. Optionally complete `/auth` once and save `GOOGLE_REFRESH_TOKEN` for Calendar.
+6. Rotate any Google refresh token that may appear in older Railway logs.
+7. Confirm `/qr` returns 404 and `/morning` returns 401 without a Bearer token.
+8. Confirm `/health/db` returns `"database":"up"` after the pre-deploy Prisma migration.
+9. Confirm Contacts, Tasks, Payments, and Inbox APIs still work with a Bearer token.
+10. Confirm Multi-Inbox analyze still works on synced Gmail items without auto-creating Tasks/Payments.

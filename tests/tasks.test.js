@@ -34,7 +34,7 @@ const VALID_ENV = {
   ANTHROPIC_API_KEY: 'test-anthropic-key',
   GOOGLE_CLIENT_ID: 'test-google-client-id',
   GOOGLE_CLIENT_SECRET: 'test-google-client-secret',
-  GOOGLE_REDIRECT_URI: 'https://example.com/auth/callback',
+  GOOGLE_CALENDAR_REDIRECT_URI: 'https://example.com/auth/callback',
   ADMIN_API_KEY: 'test-admin-api-key',
 };
 

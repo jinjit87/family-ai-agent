@@ -6,6 +6,7 @@ const { createContactsRouter } = require('./lib/contactsRouter');
 const { createTasksRouter } = require('./lib/tasksRouter');
 const { createPaymentsRouter } = require('./lib/paymentsRouter');
 const { createInboxRouter } = require('./lib/inboxRouter');
+const { createGmailRouter } = require('./lib/gmailRouter');
 
 const SERVICE_NAME = 'family-ai-agent';
 const CALENDAR_READONLY_SCOPE = 'https://www.googleapis.com/auth/calendar.readonly';
@@ -27,10 +28,12 @@ function requireAdmin(env) {
 }
 
 function createOAuthClient(env) {
+  // Calendar OAuth uses GOOGLE_CALENDAR_REDIRECT_URI only (never Gmail redirect).
+  const redirectUri = env.GOOGLE_CALENDAR_REDIRECT_URI;
   const oauth2Client = new google.auth.OAuth2(
     env.GOOGLE_CLIENT_ID,
     env.GOOGLE_CLIENT_SECRET,
-    env.GOOGLE_REDIRECT_URI
+    redirectUri
   );
 
   if (env.GOOGLE_REFRESH_TOKEN) {
@@ -229,6 +232,11 @@ function createApp(env) {
   // Phase 6: Multi-Inbox AI Inbox (additive — does not alter existing endpoints).
   app.use('/inbox', createInboxRouter({ adminAuth }));
 
+  // Gmail connector MVP (multi-account OAuth + manual sync).
+  // /gmail/callback is public (browser redirect); other /gmail routes require admin Bearer.
+  // Bearer token is never placed in browser URLs — connect issues a signed state instead.
+  app.use('/gmail', createGmailRouter({ adminAuth, env }));
+
   // Final catch-all — must remain the last route/middleware.
   app.use((_req, res) => {
     res.status(404).json({ error: 'Not found' });
@@ -263,6 +271,7 @@ module.exports = {
   createApp,
   loadEnv,
   requireAdmin,
+  createOAuthClient,
   SERVICE_NAME,
   CALENDAR_READONLY_SCOPE,
 };

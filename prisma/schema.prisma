@@ -1,0 +1,237 @@
+// Phase 2: Database Foundation
+// PostgreSQL via Prisma — no WhatsApp integration yet.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---- Enums ----
+
+enum ContactRole {
+  SELF
+  FAMILY
+  SCHOOL
+  TUTOR
+  OTHER
+}
+
+enum ConversationChannel {
+  WHATSAPP
+  INTERNAL
+  EMAIL
+}
+
+enum ConversationStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+enum MessageDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum MessageStatus {
+  RECEIVED
+  DRAFTED
+  PENDING_APPROVAL
+  APPROVED
+  SENT
+  REJECTED
+}
+
+enum TaskStatus {
+  PENDING
+  IN_PROGRESS
+  DONE
+  CANCELLED
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum CalendarProposalStatus {
+  PROPOSED
+  APPROVED
+  REJECTED
+  SCHEDULED
+  CANCELLED
+}
+
+enum ApprovalType {
+  MESSAGE_REPLY
+  CALENDAR_EVENT
+  TASK_ACTION
+  OTHER
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum RuleCategory {
+  MESSAGING
+  CALENDAR
+  TASK
+  SAFETY
+  GENERAL
+}
+
+// ---- Models ----
+
+model Contact {
+  id        String      @id @default(cuid())
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+  name      String
+  phone     String?
+  email     String?
+  role      ContactRole @default(OTHER)
+  notes     String?
+
+  conversations     Conversation[]
+  tasks             Task[]
+  calendarProposals CalendarProposal[]
+
+  @@index([phone])
+  @@index([email])
+}
+
+model Conversation {
+  id        String              @id @default(cuid())
+  createdAt DateTime            @default(now())
+  updatedAt DateTime            @updatedAt
+  contactId String
+  channel   ConversationChannel @default(INTERNAL)
+  status    ConversationStatus  @default(ACTIVE)
+  subject   String?
+  externalId String?
+
+  contact  Contact   @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  messages Message[]
+
+  @@index([contactId])
+  @@index([status])
+  @@index([externalId])
+}
+
+model Message {
+  id             String           @id @default(cuid())
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  conversationId String
+  direction      MessageDirection
+  status         MessageStatus    @default(RECEIVED)
+  content        String
+  externalId     String?
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  approvals    Approval[]
+
+  @@index([conversationId])
+  @@index([status])
+  @@index([externalId])
+}
+
+model Task {
+  id          String       @id @default(cuid())
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  title       String
+  description String?
+  status      TaskStatus   @default(PENDING)
+  priority    TaskPriority @default(MEDIUM)
+  dueAt       DateTime?
+  contactId   String?
+
+  contact   Contact?   @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  approvals Approval[]
+
+  @@index([status])
+  @@index([contactId])
+  @@index([dueAt])
+}
+
+model CalendarProposal {
+  id              String                 @id @default(cuid())
+  createdAt       DateTime               @default(now())
+  updatedAt       DateTime               @updatedAt
+  title           String
+  description     String?
+  startAt         DateTime
+  endAt           DateTime
+  status          CalendarProposalStatus @default(PROPOSED)
+  contactId       String?
+  calendarEventId String?
+
+  contact   Contact?   @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  approvals Approval[]
+
+  @@index([status])
+  @@index([contactId])
+  @@index([startAt])
+}
+
+model Approval {
+  id                 String         @id @default(cuid())
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+  type               ApprovalType
+  status             ApprovalStatus @default(PENDING)
+  summary            String?
+  payload            Json?
+  decidedAt          DateTime?
+  messageId          String?
+  taskId             String?
+  calendarProposalId String?
+
+  message          Message?          @relation(fields: [messageId], references: [id], onDelete: SetNull)
+  task             Task?             @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  calendarProposal CalendarProposal? @relation(fields: [calendarProposalId], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([type])
+  @@index([messageId])
+  @@index([taskId])
+  @@index([calendarProposalId])
+}
+
+model Rule {
+  id          String       @id @default(cuid())
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  name        String
+  description String?
+  category    RuleCategory @default(GENERAL)
+  enabled     Boolean      @default(true)
+  config      Json?
+
+  @@unique([name])
+  @@index([category])
+  @@index([enabled])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  action     String
+  actor      String?
+  entityType String?
+  entityId   String?
+  metadata   Json?
+
+  @@index([action])
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}

@@ -1,6 +1,7 @@
 const express = require('express');
 const { google } = require('googleapis');
 const { loadEnv } = require('./lib/env');
+const { checkDatabaseHealth } = require('./lib/db');
 
 const SERVICE_NAME = 'family-ai-agent';
 const CALENDAR_READONLY_SCOPE = 'https://www.googleapis.com/auth/calendar.readonly';
@@ -125,6 +126,22 @@ function createApp(env) {
       timestamp: new Date().toISOString(),
       service: SERVICE_NAME,
     });
+  });
+
+  // Database connectivity check (Phase 2). Does not alter /health.
+  app.get('/health/db', async (_req, res) => {
+    const result = await checkDatabaseHealth();
+    const body = {
+      status: result.ok ? 'ok' : 'error',
+      database: result.ok ? 'up' : 'down',
+      latencyMs: result.latencyMs,
+      timestamp: new Date().toISOString(),
+      service: SERVICE_NAME,
+    };
+    if (!result.ok && result.error) {
+      body.error = result.error;
+    }
+    return res.status(result.ok ? 200 : 503).json(body);
   });
 
   // Operational: start Google OAuth (Calendar readonly only).

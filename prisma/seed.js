@@ -1,6 +1,6 @@
 /**
  * Seed foundational sample data for local / Railway setup.
- * Creates: one Contact, one Conversation, one Task.
+ * Creates: one Contact, one Conversation, one Task, one Payment.
  *
  * Usage: npm run db:seed
  * Requires: DATABASE_URL
@@ -74,10 +74,52 @@ async function main() {
     },
   });
 
+  const due = new Date();
+  due.setDate(due.getDate() + 3);
+
+  const payment = await prisma.payment.upsert({
+    where: { id: 'seed_payment_school_fees' },
+    update: {
+      payeeName: 'School Fees Office',
+      contactId: contact.id,
+      businessUnit: 'FAMILY',
+      category: 'education',
+      description: 'Upcoming school fees installment (seed)',
+      amount: '1250.0000',
+      currency: 'ILS',
+      dueDate: due,
+      status: 'APPROVED',
+      invoiceNumber: 'SEED-INV-001',
+      paymentMethod: null,
+      paidAt: null,
+      approvedAt: new Date(),
+      notes: 'Seed payment for Payments Due Engine',
+      source: 'MANUAL',
+      deletedAt: null,
+    },
+    create: {
+      id: 'seed_payment_school_fees',
+      payeeName: 'School Fees Office',
+      contactId: contact.id,
+      businessUnit: 'FAMILY',
+      category: 'education',
+      description: 'Upcoming school fees installment (seed)',
+      amount: '1250.0000',
+      currency: 'ILS',
+      dueDate: due,
+      status: 'APPROVED',
+      invoiceNumber: 'SEED-INV-001',
+      approvedAt: new Date(),
+      notes: 'Seed payment for Payments Due Engine',
+      source: 'MANUAL',
+    },
+  });
+
   console.log('Seed complete:');
   console.log(`  Contact:      ${contact.id} (${contact.name})`);
   console.log(`  Conversation: ${conversation.id} (${conversation.subject})`);
   console.log(`  Task:         ${task.id} (${task.title})`);
+  console.log(`  Payment:      ${payment.id} (${payment.payeeName} ${payment.amount} ${payment.currency})`);
 }
 
 main()

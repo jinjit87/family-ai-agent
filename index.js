@@ -172,11 +172,11 @@ async function connectWhatsApp() {
 
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('connection.update', async (update) => {
+ sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
     if (qr) {
       latestQR = qr;
-      console.log('QR ready — visit /qr');
+      console.log('QR CODE RECEIVED - length:', qr.length);
     }
     if (connection === 'close') {
       const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;

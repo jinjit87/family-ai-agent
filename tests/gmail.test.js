@@ -3157,8 +3157,33 @@ describe('gmail production readiness', () => {
     const account = await createAccount('logs@prod-ready.gmail-test.example', 'logs-google');
     const installed = adapter({
       async listMessages() {
-        const err = new Error('SecretSubjectXYZ access-token-value refresh-token-value');
-        err.response = { status: 503, data: { error: 'backendError' } };
+        const err = new Error('Request failed with status code 403');
+        err.code = 403;
+        err.config = {
+          url: 'https://gmail.googleapis.com/gmail/v1/users/me/messages?access_token=ya29.secret-access',
+          headers: { Authorization: 'Bearer ya29.secret-access' },
+        };
+        err.response = {
+          status: 403,
+          data: {
+            error: {
+              code: 403,
+              message: 'Gmail API has not been used in project 123 before or access-token-value is invalid',
+              status: 'PERMISSION_DENIED',
+              errors: [
+                {
+                  message: 'Gmail API has not been used in project 123',
+                  domain: 'usageLimits',
+                  reason: 'accessNotConfigured',
+                },
+              ],
+            },
+          },
+          config: {
+            url: 'https://gmail.googleapis.com/gmail/v1/users/me/messages',
+            headers: { Authorization: 'Bearer ya29.secret-access' },
+          },
+        };
         throw err;
       },
     });
@@ -3174,10 +3199,45 @@ describe('gmail production readiness', () => {
       console.error = originalError;
     }
     assert.ok(logs.length > 0);
+    const joined = logs.join('\n');
+    assert.match(joined, /PERMISSION_DENIED|accessNotConfigured/);
+    assert.match(joined, /googleErrorMessage/);
+    assert.match(joined, /gmail\.googleapis\.com/);
+    assert.equal(joined.includes('ya29.secret-access'), false);
+    assert.equal(joined.includes('Bearer ya29'), false);
     for (const line of logs) {
       assertNoSecrets(line);
-      assert.equal(line.includes('SecretSubjectXYZ'), false);
       assert.equal(line.includes('refresh-token-value'), false);
+      assert.equal(line.includes('access-token-value'), false);
     }
+  });
+
+  it('extractGoogleApiErrorDetails captures Google response fields without tokens', () => {
+    const { extractGoogleApiErrorDetails, getSafeErrorCode } = require('../lib/gmail');
+    const err = new Error('wrapper');
+    err.code = 403;
+    err.response = {
+      status: 403,
+      data: {
+        error: {
+          code: 403,
+          message: 'Access denied for refresh-token-value',
+          status: 'PERMISSION_DENIED',
+          errors: [{ reason: 'forbidden', message: 'Insufficient Permission' }],
+        },
+      },
+      config: {
+        url: 'https://gmail.googleapis.com/gmail/v1/users/me/messages?access_token=ya29.abc',
+      },
+    };
+    const details = extractGoogleApiErrorDetails(err);
+    assert.equal(getSafeErrorCode(err), 'PERMISSION_DENIED');
+    assert.match(details.googleErrorMessage, /Access denied/);
+    assert.equal(details.googleErrorMessage.includes('refresh-token-value'), false);
+    assert.ok(Array.isArray(details.googleErrors));
+    assert.ok(details.googleResponseData);
+    assert.match(details.requestUrl, /gmail\.googleapis\.com/);
+    assert.equal(details.requestUrl.includes('ya29.abc'), false);
+    assert.match(details.requestUrl, /\[REDACTED\]/);
   });
 });

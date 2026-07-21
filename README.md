@@ -64,6 +64,7 @@ HTTP
  ├── POST /inbox/:id/archive     admin Bearer required → archive inbox item
  ├── POST /inbox/:id/*-suggestions/:suggestionId/{approve|reject|apply}
  ├── GET /briefing/daily         admin Bearer required → email daily briefing aggregates
+ ├── POST /admin/reset-analysis  staging-only admin → clear AI analysis fields on InboxItems
  ├── GET /gmail/connect          admin Bearer required → start Gmail OAuth (no Bearer in browser URL)
  ├── GET /gmail/callback         public Google redirect → save encrypted credentials
  ├── GET /gmail/accounts         admin Bearer required → list connected Gmail accounts
@@ -126,6 +127,8 @@ Create a local `.env` file (never commit it), or export variables in your shell.
 | `AI_PROVIDER` | when AI enabled | `mock` or `anthropic` (default `anthropic` when enabled) |
 | `AI_MODEL` | no | Model id for Anthropic provider (default `claude-sonnet-4-6`) |
 | `AI_API_KEY` | when AI enabled + anthropic | Optional override; falls back to `ANTHROPIC_API_KEY` |
+| `STAGING_ADMIN_TOOLS` | no | Set `true` to enable staging-only admin endpoints (e.g. `POST /admin/reset-analysis`) even when `NODE_ENV=production` (typical on Railway staging) |
+| `NODE_ENV` | no | When `production` (and `STAGING_ADMIN_TOOLS` is not `true`), staging admin tools return `403` |
 
 \* Calendar redirect: set `GOOGLE_CALENDAR_REDIRECT_URI` (preferred) or temporarily `GOOGLE_REDIRECT_URI`. Gmail is fail-closed: if either `TOKEN_ENCRYPTION_KEY` or `GOOGLE_GMAIL_REDIRECT_URI` is set, **all** of `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_GMAIL_REDIRECT_URI`, `TOKEN_ENCRYPTION_KEY`, and `DATABASE_URL` are required. AI email analysis env vars are validated **only when** `AI_EMAIL_ANALYSIS_ENABLED=true`.
 
@@ -855,6 +858,16 @@ Logs include message id, category, status, latency, and sanitized failure reason
 Never logged: full email bodies, API keys, OAuth tokens, `DATABASE_URL`, or raw provider payloads.
 
 ### Staging test checklist
+
+0. (Optional) On Railway staging set `STAGING_ADMIN_TOOLS=true`, then clear prior analysis without re-syncing Gmail:
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
+  https://YOUR_STAGING_HOST/admin/reset-analysis
+# → { "resetCount": N }
+```
+
+This clears `processedAt`, `category`, `urgency`, `confidence`, `requiresAction`, `dueDate`, `suggestedTask`, and `summary`, and returns analyzed items to `NEW`. It does **not** delete InboxItems or Gmail sync state. Disabled in production unless `STAGING_ADMIN_TOOLS=true`.
 
 1. Run migration on staging DB (`prisma migrate deploy`); confirm existing Gmail `InboxItem` rows still readable.
 2. Keep `AI_EMAIL_ANALYSIS_ENABLED` unset/false; sync a Gmail account; `POST /inbox/analyze` with `unprocessedOnly:true`.

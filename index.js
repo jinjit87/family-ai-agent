@@ -7,6 +7,7 @@ const { createTasksRouter } = require('./lib/tasksRouter');
 const { createPaymentsRouter } = require('./lib/paymentsRouter');
 const { createInboxRouter } = require('./lib/inboxRouter');
 const { createBriefingRouter } = require('./lib/briefingRouter');
+const { createAdminRouter } = require('./lib/adminRouter');
 const { createGmailRouter } = require('./lib/gmailRouter');
 
 const SERVICE_NAME = 'family-ai-agent';
@@ -235,6 +236,9 @@ function createApp(env) {
 
   // Email analysis daily briefing (additive).
   app.use('/briefing', createBriefingRouter({ adminAuth }));
+
+  // Staging-only admin tools (disabled when NODE_ENV=production unless STAGING_ADMIN_TOOLS=true).
+  app.use('/admin', createAdminRouter({ adminAuth, env }));
 
   // Gmail connector MVP (multi-account OAuth + manual sync).
   // /gmail/callback is public (browser redirect); other /gmail routes require admin Bearer.

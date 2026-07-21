@@ -149,6 +149,21 @@ enum Urgency {
   MEDIUM
   HIGH
   URGENT
+  CRITICAL
+}
+
+enum EmailCategory {
+  BILL
+  RECEIPT
+  PACKAGE
+  TRAVEL
+  WORK
+  PERSONAL
+  LEGAL
+  FINANCIAL
+  SECURITY
+  MARKETING
+  OTHER
 }
 
 enum SuggestionStatus {
@@ -440,10 +455,15 @@ model InboxItem {
   recipients       Json?
   subject          String?
   rawContent       String
+  // conciseSummary from AI analysis is stored in summary (existing field).
   summary          String?
   status           InboxStatus        @default(NEW)
   confidence       Float?
   urgency          Urgency?
+  category         EmailCategory?
+  requiresAction   Boolean?
+  dueDate          DateTime?
+  suggestedTask    String?
   receivedAt       DateTime
   processedAt      DateTime?
 
@@ -459,6 +479,9 @@ model InboxItem {
   @@index([source])
   @@index([status])
   @@index([urgency])
+  @@index([category])
+  @@index([requiresAction])
+  @@index([dueDate])
   @@index([senderIdentifier])
   @@index([receivedAt])
   @@index([updatedAt])

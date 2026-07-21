@@ -6,6 +6,7 @@ const { createContactsRouter } = require('./lib/contactsRouter');
 const { createTasksRouter } = require('./lib/tasksRouter');
 const { createPaymentsRouter } = require('./lib/paymentsRouter');
 const { createInboxRouter } = require('./lib/inboxRouter');
+const { createBriefingRouter } = require('./lib/briefingRouter');
 const { createGmailRouter } = require('./lib/gmailRouter');
 
 const SERVICE_NAME = 'family-ai-agent';
@@ -231,6 +232,9 @@ function createApp(env) {
 
   // Phase 6: Multi-Inbox AI Inbox (additive — does not alter existing endpoints).
   app.use('/inbox', createInboxRouter({ adminAuth }));
+
+  // Email analysis daily briefing (additive).
+  app.use('/briefing', createBriefingRouter({ adminAuth }));
 
   // Gmail connector MVP (multi-account OAuth + manual sync).
   // /gmail/callback is public (browser redirect); other /gmail routes require admin Bearer.

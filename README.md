@@ -12,6 +12,7 @@ Family AI assistant for calendar-aware briefings (Anthropic + Google Calendar).
 - **Tasks API:** task management over Prisma `Task` (Phase 4)
 - **Payments API:** payments due engine over Prisma `Payment` (Phase 5)
 - **Inbox API:** multi-account AI inbox pipeline over Prisma `InboxAccount` / `InboxItem` (Phase 6)
+- **Email AI analysis:** structured triage (category/urgency/action/due date) via pluggable provider (mock by default; Anthropic opt-in)
 - **Gmail connector:** multi-account Google OAuth + encrypted tokens + manual sync (MVP)
 - **Auth:** shared admin secret (`ADMIN_API_KEY`) for operational HTTP routes
 - **Hosting:** Railway-compatible (`Procfile`, `PORT`)
@@ -53,11 +54,16 @@ HTTP
  ├── POST /inbox/accounts/:id/deactivate admin Bearer required → deactivate account
  ├── GET /inbox                  admin Bearer required → list/search inbox items
  ├── POST /inbox                 admin Bearer required → ingest inbox item
+ ├── GET /inbox/important        admin Bearer required → high/critical urgency items
+ ├── GET /inbox/tasks            admin Bearer required → requiresAction items
+ ├── GET /inbox/bills            admin Bearer required → category=BILL items
+ ├── POST /inbox/analyze         admin Bearer required → batch/selective AI analysis
  ├── GET /inbox/:id              admin Bearer required → get inbox item (+ rawContent)
  ├── PATCH /inbox/:id            admin Bearer required → update inbox item
- ├── POST /inbox/:id/analyze     admin Bearer required → mock AI analysis
+ ├── POST /inbox/:id/analyze     admin Bearer required → analyze one inbox item
  ├── POST /inbox/:id/archive     admin Bearer required → archive inbox item
  ├── POST /inbox/:id/*-suggestions/:suggestionId/{approve|reject|apply}
+ ├── GET /briefing/daily         admin Bearer required → email daily briefing aggregates
  ├── GET /gmail/connect          admin Bearer required → start Gmail OAuth (no Bearer in browser URL)
  ├── GET /gmail/callback         public Google redirect → save encrypted credentials
  ├── GET /gmail/accounts         admin Bearer required → list connected Gmail accounts
@@ -116,8 +122,12 @@ Create a local `.env` file (never commit it), or export variables in your shell.
 | `MY_WHATSAPP` | no | Reserved; unused while WhatsApp is disabled |
 | `DATABASE_URL` | no* | PostgreSQL URL. Optional for bare app startup; **required when Gmail is enabled**, and for migrations/seeds/Inbox APIs/`/health/db` |
 | `GOOGLE_REDIRECT_URI` | deprecated | Temporary **Calendar-only** fallback if `GOOGLE_CALENDAR_REDIRECT_URI` is unset. Never used for Gmail. Remove after migrating all environments |
+| `AI_EMAIL_ANALYSIS_ENABLED` | no | Set `true` to enable live AI email analysis. Default/unset → mock provider (no external LLM calls for inbox analysis) |
+| `AI_PROVIDER` | when AI enabled | `mock` or `anthropic` (default `anthropic` when enabled) |
+| `AI_MODEL` | no | Model id for Anthropic provider (default `claude-sonnet-4-6`) |
+| `AI_API_KEY` | when AI enabled + anthropic | Optional override; falls back to `ANTHROPIC_API_KEY` |
 
-\* Calendar redirect: set `GOOGLE_CALENDAR_REDIRECT_URI` (preferred) or temporarily `GOOGLE_REDIRECT_URI`. Gmail is fail-closed: if either `TOKEN_ENCRYPTION_KEY` or `GOOGLE_GMAIL_REDIRECT_URI` is set, **all** of `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_GMAIL_REDIRECT_URI`, `TOKEN_ENCRYPTION_KEY`, and `DATABASE_URL` are required.
+\* Calendar redirect: set `GOOGLE_CALENDAR_REDIRECT_URI` (preferred) or temporarily `GOOGLE_REDIRECT_URI`. Gmail is fail-closed: if either `TOKEN_ENCRYPTION_KEY` or `GOOGLE_GMAIL_REDIRECT_URI` is set, **all** of `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_GMAIL_REDIRECT_URI`, `TOKEN_ENCRYPTION_KEY`, and `DATABASE_URL` are required. AI email analysis env vars are validated **only when** `AI_EMAIL_ANALYSIS_ENABLED=true`.
 
 Add **both** callback URIs to the same Google OAuth web client when using Calendar and Gmail.
 
@@ -708,7 +718,7 @@ Reply suggestions have no outbound send yet — `apply` only marks them `APPLIED
 - List endpoints **omit `rawContent`** by default; detail (`GET /inbox/:id`) includes it.
 - Suggestion routes require `suggestionId` to belong to the inbox item in the URL; task/payment/reply suggestion types cannot be mixed across endpoints (`404`).
 - Responses and logs never expose OAuth tokens, credentials, `DATABASE_URL`, SQL, Prisma codes, raw provider errors, or `rawContent` on list responses.
-- Mock analysis returns concise user-facing reasons only (no chain-of-thought). Anthropic is not called from the inbox analyzer yet.
+- Mock analysis returns concise user-facing reasons only (no chain-of-thought). Live Anthropic analysis is opt-in via `AI_EMAIL_ANALYSIS_ENABLED` (see AI email analysis section).
 
 ### Inbox accounts
 
@@ -743,7 +753,8 @@ curl -H "Authorization: Bearer $ADMIN_API_KEY" \
 | `sort` | `receivedAt` | `receivedAt` \| `updatedAt` \| `urgency` |
 
 Statuses: `NEW` | `PROCESSING` | `READY_FOR_REVIEW` | `APPROVED` | `REJECTED` | `ARCHIVED` | `FAILED`.  
-Urgency: `LOW` | `MEDIUM` | `HIGH` | `URGENT`.
+Urgency: `LOW` | `MEDIUM` | `HIGH` | `URGENT` | `CRITICAL`.  
+Categories: `BILL` | `RECEIPT` | `PACKAGE` | `TRAVEL` | `WORK` | `PERSONAL` | `LEGAL` | `FINANCIAL` | `SECURITY` | `MARKETING` | `OTHER`.
 
 ### Analyze + suggestions
 
@@ -756,6 +767,104 @@ curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
 ```
 
 Same approve/reject/apply paths exist for `payment-suggestions` and `reply-suggestions`.
+
+Analysis persists structured fields on `InboxItem` (`category`, `urgency`, `requiresAction`, `dueDate`, `summary` as concise summary, `suggestedTask`, `confidence`, `processedAt`) and still creates suggestion rows for human approve/apply. It **never** auto-creates Tasks/Payments, never sends email, and never makes payments.
+
+## AI email analysis (production v1)
+
+First production version of structured email triage on top of the Gmail connector + Phase 6 inbox.
+
+### Safety
+
+- Never send email, make payments, or create external tasks automatically
+- Never follow instructions found inside an email (content is untrusted)
+- System instructions are separated from email content with explicit delimiters
+- Provider must return structured JSON only; Zod validates before save
+- Validation / provider failure → status `FAILED` for retry; **no partial analysis is saved**
+- Concurrent analyze uses an atomic status claim (`NEW`/`FAILED` → `PROCESSING`) so the same message cannot be analyzed twice at once
+
+### Provider abstraction
+
+| Mode | Behavior |
+|------|----------|
+| `AI_EMAIL_ANALYSIS_ENABLED` unset/false | Mock heuristic provider (default; safe for staging/tests) |
+| `true` + `AI_PROVIDER=mock` | Explicit mock |
+| `true` + `AI_PROVIDER=anthropic` | Anthropic Messages API (`AI_API_KEY` or `ANTHROPIC_API_KEY`, optional `AI_MODEL`) |
+
+Swap providers without changing the inbox persistence layer (`lib/aiProvider.js`).
+
+### Migration
+
+Additive only — does not rewrite or delete existing Gmail/`InboxItem` data:
+
+```bash
+export DATABASE_URL="postgresql://USER:PASSWORD@localhost:5432/family_ai_agent?schema=public"
+npx prisma migrate deploy
+```
+
+Migration `20260721080000_email_analysis_fields` adds:
+- `Urgency.CRITICAL`
+- `EmailCategory` enum
+- `InboxItem.category`, `requiresAction`, `dueDate`, `suggestedTask`
+
+On Railway, `npm run db:migrate` / `prisma migrate deploy` runs via the existing pre-deploy command. **Do not deploy this to production until staging checklist passes.**
+
+### Batch analyze
+
+```bash
+# Unprocessed only (NEW + FAILED), default limit 20
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{"unprocessedOnly":true,"limit":20}' \
+  https://YOUR_HOST/inbox/analyze
+
+# One message
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{"messageIds":["MESSAGE_ID"],"unprocessedOnly":true}' \
+  https://YOUR_HOST/inbox/analyze
+
+# Explicit re-analyze (already processed)
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{"messageIds":["MESSAGE_ID"],"unprocessedOnly":false}' \
+  https://YOUR_HOST/inbox/analyze
+
+# Single-item path (allows re-analysis)
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
+  https://YOUR_HOST/inbox/MESSAGE_ID/analyze
+```
+
+### Read views + daily briefing
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_API_KEY" https://YOUR_HOST/inbox/important
+curl -H "Authorization: Bearer $ADMIN_API_KEY" https://YOUR_HOST/inbox/tasks
+curl -H "Authorization: Bearer $ADMIN_API_KEY" https://YOUR_HOST/inbox/bills
+curl -H "Authorization: Bearer $ADMIN_API_KEY" https://YOUR_HOST/briefing/daily
+```
+
+Daily briefing groups (no raw email bodies):
+- high-priority emails (`HIGH` / `URGENT` / `CRITICAL`)
+- action items (`requiresAction=true`)
+- bills and due dates
+- packages
+- security alerts
+- overdue items (due date before today)
+
+### Logging / privacy
+
+Logs include message id, category, status, latency, and sanitized failure reasons only.
+Never logged: full email bodies, API keys, OAuth tokens, `DATABASE_URL`, or raw provider payloads.
+
+### Staging test checklist
+
+1. Run migration on staging DB (`prisma migrate deploy`); confirm existing Gmail `InboxItem` rows still readable.
+2. Keep `AI_EMAIL_ANALYSIS_ENABLED` unset/false; sync a Gmail account; `POST /inbox/analyze` with `unprocessedOnly:true`.
+3. Confirm items gain `category` / `urgency` / `summary` / `processedAt` and status `READY_FOR_REVIEW`.
+4. Confirm `GET /inbox/important`, `/inbox/tasks`, `/inbox/bills`, `/briefing/daily` return expected groups without `rawContent`.
+5. Force a provider failure (or invalid stub in a test env); confirm status `FAILED`, no partial fields, and retry succeeds.
+6. Fire two concurrent `POST /inbox/:id/analyze` calls; one should win, the other `409 ANALYSIS_IN_PROGRESS`.
+7. Optionally enable `AI_EMAIL_ANALYSIS_ENABLED=true` with `AI_PROVIDER=anthropic` and a staging key; re-run a small batch; confirm no keys appear in logs.
+8. Confirm no Task/Payment rows were auto-created and no outbound email was sent.
+9. **Do not promote to production until the above passes.**
 
 Mock analysis returns `{ summary, urgency, confidence, suggestedTasks, suggestedPayments, suggestedReplies }` with per-suggestion `confidence`, `reason`, and `evidence`.
 

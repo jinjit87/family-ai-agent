@@ -385,10 +385,14 @@ model InboxAccount {
   lastSyncError     String?
   // Lease-based sync lock. Null/expired = available. Survives process restart.
   syncLockExpiresAt DateTime?
+  // Ownership token for the active sync lease. Required for renew/release/cursor writes.
+  syncLockToken     String?
 
   items           InboxItem[]
   gmailCredential GmailCredential?
 
+  // One Gmail identity → one InboxAccount (NULL externalAccountId still allowed for non-Gmail).
+  @@unique([source, externalAccountId])
   @@index([source])
   @@index([isActive])
   @@index([emailAddress])

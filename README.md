@@ -852,6 +852,10 @@ Daily briefing groups (no raw email bodies):
 - security alerts
 - overdue items (due date before today)
 
+**Result quality (important / tasks / briefing):**
+- Past meeting/calendar/reminder/event emails (due date/time already passed) are auto-archived and excluded from `/inbox/important` and `/inbox/tasks`. Overdue bills stay visible.
+- Multiple messages in the same Gmail thread (`threadExternalId`) collapse to one actionable item — the newest message (latest summary / suggested task).
+
 ### Logging / privacy
 
 Logs include message id, category, status, latency, and sanitized failure reasons only.

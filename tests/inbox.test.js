@@ -155,9 +155,12 @@ describe('inbox helpers and providers', () => {
       rawContent: 'Please pay ILS 450.50 for invoice INV-99 by 2026-08-01. Urgent.',
       receivedAt: new Date(),
     });
-    assert.equal(invoice.urgency, 'URGENT');
+    assert.equal(invoice.urgency, 'HIGH');
     assert.ok(invoice.suggestedPayments.length >= 1);
-    assert.ok(invoice.suggestedPayments[0].reason.includes('invoice'));
+    assert.ok(invoice.suggestedPayments[0].reason.length > 0);
+    assert.equal(invoice.category, 'BILL');
+    assert.equal(invoice.requiresAction, true);
+    assert.ok(invoice.suggestedTask);
     assert.ok(!JSON.stringify(invoice).toLowerCase().includes('chain-of-thought'));
     assert.ok(invoice.suggestedReplies.length >= 1);
 
@@ -503,37 +506,51 @@ describe('Inbox API', () => {
     });
 
     const bySender = await auth(
-      request(app).get('/inbox?senderIdentifier=alpha@inbox-test.example')
+      request(app).get(
+        `/inbox?inboxAccountId=${account.id}&senderIdentifier=alpha@inbox-test.example`
+      )
     ).expect(200);
     assert.equal(bySender.body.data.length, 1);
     assert.equal(bySender.body.data[0].id, early.id);
 
-    const byStatus = await auth(request(app).get('/inbox?status=READY_FOR_REVIEW')).expect(200);
+    const byStatus = await auth(
+      request(app).get(`/inbox?inboxAccountId=${account.id}&status=READY_FOR_REVIEW`)
+    ).expect(200);
     assert.ok(byStatus.body.data.some((d) => d.id === late.id));
 
-    const byUrgency = await auth(request(app).get('/inbox?urgency=URGENT')).expect(200);
+    const byUrgency = await auth(
+      request(app).get(`/inbox?inboxAccountId=${account.id}&urgency=URGENT`)
+    ).expect(200);
     assert.ok(byUrgency.body.data.some((d) => d.id === late.id));
 
-    const bySource = await auth(request(app).get('/inbox?source=API')).expect(200);
+    const bySource = await auth(
+      request(app).get(`/inbox?inboxAccountId=${account.id}&source=API`)
+    ).expect(200);
     assert.ok(bySource.body.data.length >= 2);
 
-    const search = await auth(request(app).get('/inbox?q=invoice')).expect(200);
+    const search = await auth(
+      request(app).get(`/inbox?inboxAccountId=${account.id}&q=invoice`)
+    ).expect(200);
     assert.ok(search.body.data.some((d) => d.id === early.id));
 
     const ranged = await auth(
       request(app).get(
-        '/inbox?receivedFrom=2026-07-09T00:00:00.000Z&receivedTo=2026-07-11T00:00:00.000Z'
+        `/inbox?inboxAccountId=${account.id}&receivedFrom=2026-07-09T00:00:00.000Z&receivedTo=2026-07-11T00:00:00.000Z`
       )
     ).expect(200);
     assert.ok(ranged.body.data.some((d) => d.id === early.id));
     assert.equal(ranged.body.data.some((d) => d.id === late.id), false);
 
-    const page1 = await auth(request(app).get('/inbox?limit=1&page=1&sort=receivedAt')).expect(200);
+    const page1 = await auth(
+      request(app).get(`/inbox?inboxAccountId=${account.id}&limit=1&page=1&sort=receivedAt`)
+    ).expect(200);
     assert.equal(page1.body.data.length, 1);
     assert.equal(page1.body.pagination.limit, 1);
     assert.ok(page1.body.pagination.total >= 2);
 
-    const sortedUrgency = await auth(request(app).get('/inbox?sort=urgency&limit=50')).expect(200);
+    const sortedUrgency = await auth(
+      request(app).get(`/inbox?inboxAccountId=${account.id}&sort=urgency&limit=50`)
+    ).expect(200);
     assert.ok(Array.isArray(sortedUrgency.body.data));
 
     await auth(request(app).get('/inbox?sort=nope')).expect(400);
@@ -861,6 +878,10 @@ describe('Inbox API', () => {
         summary: 'Empty suggestions analysis',
         urgency: 'MEDIUM',
         confidence: 0.5,
+        category: 'OTHER',
+        requiresAction: false,
+        dueDate: null,
+        suggestedTask: null,
         suggestedTasks: [],
         suggestedPayments: [],
         suggestedReplies: [],

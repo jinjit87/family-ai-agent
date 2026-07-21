@@ -48,6 +48,7 @@ const {
   isSpamOrTrash,
   extractMessageBody,
   capBodySize,
+  INITIAL_SYNC_LIMIT,
   MAX_BODY_CHARS,
   OAUTH_STATE_TTL_MS,
   SYNC_LOCK_LEASE_MS,
@@ -61,6 +62,16 @@ const {
   getAuthorizedClient,
   summarizeSyncResult,
   isHistoryIdInvalid,
+  getGmailSyncConfig,
+  parseAndVerifyOAuthState,
+  renewSyncLock,
+  isSafeCursorAdvance,
+  isRetryableGoogleError,
+  withGoogleRetries,
+  setGmailTestHooks,
+  resetGmailTestHooks,
+  SYNC_LOCK_RENEW_EVERY_MS,
+  defaults: GMAIL_SYNC_DEFAULTS,
 } = require('../lib/gmail');
 const {
   setGmailApiAdapter,
@@ -469,12 +480,14 @@ describe('gmail HTTP routes and sync', () => {
 
   after(async () => {
     resetGmailApiAdapter();
+    resetGmailTestHooks();
     await clearOAuthStates();
   });
 
   beforeEach(async () => {
     await clearOAuthStates();
     resetGmailApiAdapter();
+    resetGmailTestHooks();
   });
 
   afterEach(async () => {
@@ -496,6 +509,7 @@ describe('gmail HTTP routes and sync', () => {
       await prisma.inboxAccount.deleteMany({ where: { id: { in: ids } } });
     }
     resetGmailApiAdapter();
+    resetGmailTestHooks();
     await clearOAuthStates();
   });
 
@@ -1182,7 +1196,7 @@ describe('gmail HTTP routes and sync', () => {
     adapter.__store.historyId = 'hist-lock';
 
     const locked = await acquireSyncLock(accountA.id);
-    assert.equal(locked, true);
+    assert.ok(locked);
 
     const serviceResult = await syncGmailAccount(accountA.id, env);
     assert.equal(serviceResult.syncInProgress, true);
@@ -1195,7 +1209,7 @@ describe('gmail HTTP routes and sync', () => {
     const syncB = await auth(request(app).post(`/gmail/accounts/${accountB.id}/sync`)).expect(200);
     assert.equal(syncB.body.status, 'ok');
 
-    await releaseSyncLock(accountA.id, { syncStatus: SYNC_STATUS.IDLE });
+    await releaseSyncLock(accountA.id, { syncStatus: SYNC_STATUS.IDLE }, locked);
     const afterRelease = await auth(request(app).post(`/gmail/accounts/${accountA.id}/sync`)).expect(
       200
     );
@@ -1324,6 +1338,7 @@ describe('privacy in errors', () => {
 
   after(async () => {
     resetGmailApiAdapter();
+    resetGmailTestHooks();
     await clearOAuthStates();
     await disconnectPrisma();
   });
@@ -1347,6 +1362,7 @@ describe('privacy in errors', () => {
       await prisma.inboxAccount.deleteMany({ where: { id: { in: ids } } });
     }
     resetGmailApiAdapter();
+    resetGmailTestHooks();
     await clearOAuthStates();
   });
 
@@ -1818,7 +1834,13 @@ describe('callback HTML escaping and router security paths', () => {
         assert.equal(line.includes('access-token-value'), false);
         assert.equal(line.includes(ENCRYPTION_KEY), false);
         assert.equal(line.includes(VALID_ENV.DATABASE_URL), false);
-        assert.match(line, /Failed to .* gmail resource/);
+        if (line.startsWith('{')) {
+          const event = JSON.parse(line);
+          assert.equal(event.gmail, true);
+          assert.match(event.operation, /^router_/);
+        } else {
+          assert.match(line, /Failed to .* gmail resource/);
+        }
       }
     } finally {
       console.error = originalError;
@@ -1852,6 +1874,7 @@ describe('sync lease, history fallback, auth errors, credential lifecycle', () =
       fixtureAccountIds.length = 0;
     }
     resetGmailApiAdapter();
+    resetGmailTestHooks();
   });
 
   function enc(v) {
@@ -1888,8 +1911,9 @@ describe('sync lease, history fallback, auth errors, credential lifecycle', () =
       syncLockExpiresAt: new Date(Date.now() - 1000),
       syncStatus: SYNC_STATUS.SYNCING,
     });
-    assert.equal(await acquireSyncLock(account.id), true);
-    await releaseSyncLock(account.id, { syncStatus: SYNC_STATUS.IDLE });
+    const token = await acquireSyncLock(account.id);
+    assert.ok(token);
+    await releaseSyncLock(account.id, { syncStatus: SYNC_STATUS.IDLE }, token);
 
     setGmailApiAdapter({
       async refreshAccessToken() {
@@ -2773,6 +2797,387 @@ describe('safe summaries, history classifier, missing credentials, router catche
       assert.equal(hist.historyId, '3');
     } finally {
       google.gmail = origGmail;
+    }
+  });
+});
+
+describe('gmail production readiness', () => {
+  const fixtureAccountIds = [];
+
+  beforeEach(async () => {
+    process.env.DATABASE_URL = VALID_ENV.DATABASE_URL;
+    await clearOAuthStates();
+    resetGmailApiAdapter();
+    resetGmailTestHooks();
+  });
+
+  afterEach(async () => {
+    const prisma = getPrisma();
+    if (fixtureAccountIds.length) {
+      await prisma.inboxItem.deleteMany({ where: { inboxAccountId: { in: fixtureAccountIds } } });
+      await prisma.gmailCredential.deleteMany({ where: { inboxAccountId: { in: fixtureAccountIds } } });
+      await prisma.inboxAccount.deleteMany({ where: { id: { in: fixtureAccountIds } } });
+      fixtureAccountIds.length = 0;
+    }
+    const leftovers = await prisma.inboxAccount.findMany({
+      where: { emailAddress: { endsWith: '@prod-ready.gmail-test.example' } },
+      select: { id: true },
+    });
+    const ids = leftovers.map((r) => r.id);
+    if (ids.length) {
+      await prisma.inboxItem.deleteMany({ where: { inboxAccountId: { in: ids } } });
+      await prisma.gmailCredential.deleteMany({ where: { inboxAccountId: { in: ids } } });
+      await prisma.inboxAccount.deleteMany({ where: { id: { in: ids } } });
+    }
+    await clearOAuthStates();
+    resetGmailApiAdapter();
+    resetGmailTestHooks();
+  });
+
+  function enc(v) {
+    return encryptToken(v, VALID_ENV.TOKEN_ENCRYPTION_KEY);
+  }
+
+  async function createAccount(email, externalId, extras = {}) {
+    const prisma = getPrisma();
+    const account = await prisma.inboxAccount.create({
+      data: {
+        name: email,
+        source: 'GMAIL',
+        emailAddress: email,
+        externalAccountId: externalId,
+        isActive: true,
+        syncStatus: SYNC_STATUS.IDLE,
+        gmailCredential: {
+          create: {
+            encryptedAccessToken: enc('access-token-value'),
+            encryptedRefreshToken: enc('refresh-token-value-aaa'),
+            tokenExpiry: new Date(Date.now() + 3600_000),
+            scopes: GMAIL_OAUTH_SCOPES.join(' '),
+          },
+        },
+        ...extras,
+      },
+    });
+    fixtureAccountIds.push(account.id);
+    return account;
+  }
+
+  function adapter(overrides = {}) {
+    const store = {
+      listPages: [{ messages: [], nextPageToken: null }],
+      listCalls: [],
+      historyCalls: [],
+      history: { messageIds: [], historyId: '100' },
+      messages: {},
+      profileHistoryId: '100',
+    };
+    const installed = {
+      async exchangeCode(_client, code) {
+        return {
+          access_token: `access-token-value-${code}`,
+          refresh_token: `refresh-token-value-${code}`,
+          expiry_date: Date.now() + 3600_000,
+          scope: GMAIL_OAUTH_SCOPES.join(' '),
+        };
+      },
+      async getProfile() {
+        return {
+          id: 'prod-google',
+          email: 'prod@prod-ready.gmail-test.example',
+          name: 'Prod Ready',
+        };
+      },
+      async refreshAccessToken() {
+        return { access_token: 'access-token-value-refreshed', expiry_date: Date.now() + 3600_000 };
+      },
+      async listMessages(_client, opts = {}) {
+        store.listCalls.push(opts);
+        const index = opts.pageToken ? Number(String(opts.pageToken).replace('p', '')) : 0;
+        return store.listPages[index] || { messages: [], nextPageToken: null };
+      },
+      async listHistory(_client, startHistoryId, opts = {}) {
+        store.historyCalls.push({ startHistoryId, opts });
+        return store.history;
+      },
+      async getProfileHistoryId() {
+        return { historyId: store.profileHistoryId, emailAddress: 'prod@prod-ready.gmail-test.example' };
+      },
+      async getMessage(_client, messageId) {
+        return store.messages[messageId] || buildGmailMessage({ id: messageId, plain: `body ${messageId}` });
+      },
+      ...overrides,
+      __store: store,
+    };
+    installed.__store = store;
+    setGmailApiAdapter(installed);
+    return installed;
+  }
+
+  it('defaults and env parsing expose Gmail sync tuning knobs', () => {
+    assert.equal(INITIAL_SYNC_LIMIT, 50);
+    assert.equal(GMAIL_SYNC_DEFAULTS.GMAIL_INITIAL_SYNC_MAX_MESSAGES, 50);
+    assert.equal(SYNC_LOCK_RENEW_EVERY_MS, 60_000);
+    const cfg = getGmailSyncConfig({
+      GMAIL_INITIAL_SYNC_MAX_MESSAGES: '2',
+      GMAIL_HISTORY_MAX_PAGES: '3',
+      GMAIL_SYNC_TIMEOUT_MS: '1000',
+      GMAIL_API_MAX_RETRIES: '4',
+      GMAIL_SYNC_LEASE_MS: '500',
+    });
+    assert.deepEqual(cfg, {
+      GMAIL_INITIAL_SYNC_MAX_MESSAGES: 2,
+      GMAIL_HISTORY_MAX_PAGES: 3,
+      GMAIL_SYNC_TIMEOUT_MS: 1000,
+      GMAIL_API_MAX_RETRIES: 4,
+      GMAIL_SYNC_LEASE_MS: 500,
+    });
+  });
+
+  it('two concurrent OAuth callbacks for the same Google account leave one account', async () => {
+    adapter();
+    const env = loadEnv(VALID_ENV);
+    const s1 = await createOAuthState(VALID_ENV.ADMIN_API_KEY);
+    const s2 = await createOAuthState(VALID_ENV.ADMIN_API_KEY);
+    assert.ok(await parseAndVerifyOAuthState(s1, VALID_ENV.ADMIN_API_KEY));
+
+    const results = await Promise.all([
+      handleOAuthCallback({ code: 'one', state: s1 }, env),
+      handleOAuthCallback({ code: 'two', state: s2 }, env),
+    ]);
+    assert.equal(results.filter((r) => r.account).length, 2);
+    const rows = await getPrisma().inboxAccount.findMany({
+      where: { source: 'GMAIL', externalAccountId: 'prod-google' },
+      include: { gmailCredential: true },
+    });
+    assert.equal(rows.length, 1);
+    assert.ok(rows[0].gmailCredential);
+    fixtureAccountIds.push(rows[0].id);
+  });
+
+  it('rolls back OAuth account and state when credential persistence fails', async () => {
+    adapter({
+      async getProfile() {
+        return {
+          id: 'rollback-google',
+          email: 'rollback@prod-ready.gmail-test.example',
+          name: 'Rollback',
+        };
+      },
+    });
+    setGmailTestHooks({
+      beforeCredentialWrite: async () => {
+        throw Object.assign(new Error('fail'), { code: 'TEST_FAIL' });
+      },
+    });
+    const env = loadEnv(VALID_ENV);
+    const state = await createOAuthState(VALID_ENV.ADMIN_API_KEY);
+    const result = await handleOAuthCallback({ code: 'rollback', state }, env);
+    assert.equal(result.error, 'persist_failed');
+    assert.equal(await hasPendingOAuthState(state), true);
+    const account = await getPrisma().inboxAccount.findFirst({
+      where: { source: 'GMAIL', externalAccountId: 'rollback-google' },
+      include: { gmailCredential: true },
+    });
+    assert.equal(account, null);
+  });
+
+  it('expired lease during a long sync is handled as lock loss, not OK', async () => {
+    const account = await createAccount('lease-loss@prod-ready.gmail-test.example', 'lease-loss', {
+      syncCursor: null,
+    });
+    const installed = adapter({
+      async getMessage(_client, messageId) {
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        return buildGmailMessage({ id: messageId, plain: 'slow' });
+      },
+    });
+    installed.__store.listPages = [{ messages: [{ id: 'slow-1' }], nextPageToken: null }];
+    installed.__store.profileHistoryId = '10';
+
+    const result = await syncGmailAccount(account.id, {
+      ...loadEnv(VALID_ENV),
+      GMAIL_SYNC_LEASE_MS: '50',
+      GMAIL_SYNC_TIMEOUT_MS: '1000',
+    });
+    assert.equal(result.syncFailed, true);
+    assert.equal(result.lockLost, true);
+    const reloaded = await getPrisma().inboxAccount.findUnique({ where: { id: account.id } });
+    assert.notEqual(reloaded.syncStatus, SYNC_STATUS.OK);
+  });
+
+  it('reloads the cursor after acquiring the lock', async () => {
+    const account = await createAccount('stale@prod-ready.gmail-test.example', 'stale-google', {
+      syncCursor: '10',
+    });
+    await getPrisma().inboxAccount.update({ where: { id: account.id }, data: { syncCursor: '20' } });
+    const installed = adapter();
+    installed.__store.history = { messageIds: [], historyId: '21' };
+    const result = await syncGmailAccount(account.id, loadEnv(VALID_ENV));
+    assert.equal(result.ok, true);
+    assert.equal(installed.__store.historyCalls[0].startHistoryId, '20');
+  });
+
+  it('prevents cursor regression and refuses missing next cursors', async () => {
+    assert.equal(isSafeCursorAdvance('5', '10'), true);
+    assert.equal(isSafeCursorAdvance('10', '5'), false);
+    assert.equal(isSafeCursorAdvance('10', null), false);
+
+    const account = await createAccount('nullhist@prod-ready.gmail-test.example', 'nullhist-google', {
+      syncCursor: '10',
+    });
+    const installed = adapter();
+    installed.__store.history = { messageIds: [], historyId: null };
+    const result = await syncGmailAccount(account.id, loadEnv(VALID_ENV));
+    assert.equal(result.syncFailed, true);
+    assert.equal(result.missingHistoryId, true);
+    const reloaded = await getPrisma().inboxAccount.findUnique({ where: { id: account.id } });
+    assert.equal(reloaded.syncCursor, '10');
+  });
+
+  it('initial sync follows pages and reports configured caps', async () => {
+    const account = await createAccount('pages@prod-ready.gmail-test.example', 'pages-google');
+    const installed = adapter();
+    installed.__store.listPages = [
+      { messages: [{ id: 'p1' }], nextPageToken: 'p1' },
+      { messages: [{ id: 'p2' }], nextPageToken: null },
+    ];
+    installed.__store.profileHistoryId = '30';
+    let result = await syncGmailAccount(account.id, loadEnv(VALID_ENV));
+    assert.equal(result.ok, true);
+    assert.equal(result.fetched, 2);
+    assert.equal(installed.__store.listCalls.length, 2);
+
+    await getPrisma().inboxAccount.update({ where: { id: account.id }, data: { syncCursor: null } });
+    installed.__store.listCalls.length = 0;
+    installed.__store.listPages = [
+      { messages: [{ id: 'c1' }, { id: 'c2' }], nextPageToken: 'p1' },
+      { messages: [{ id: 'c3' }], nextPageToken: null },
+    ];
+    installed.__store.profileHistoryId = '31';
+    result = await syncGmailAccount(account.id, {
+      ...loadEnv(VALID_ENV),
+      GMAIL_INITIAL_SYNC_MAX_MESSAGES: '2',
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.fetched, 2);
+    assert.equal(result.capped, true);
+    assert.equal(result.capReason, 'initial_sync_max_messages');
+  });
+
+  it('retries Gmail 429 and 5xx but not permanent auth failures', async () => {
+    let attempts429 = 0;
+    const ok429 = await withGoogleRetries(
+      async () => {
+        attempts429 += 1;
+        if (attempts429 === 1) throw Object.assign(new Error('rate'), { code: 429 });
+        return 'ok';
+      },
+      { env: { GMAIL_API_MAX_RETRIES: '2' }, sleep: async () => {} }
+    );
+    assert.equal(ok429, 'ok');
+    assert.equal(attempts429, 2);
+
+    let attempts5xx = 0;
+    await withGoogleRetries(
+      async () => {
+        attempts5xx += 1;
+        if (attempts5xx === 1) {
+          const err = new Error('backend');
+          err.response = { status: 503 };
+          throw err;
+        }
+        return 'ok';
+      },
+      { env: { GMAIL_API_MAX_RETRIES: '2' }, sleep: async () => {} }
+    );
+    assert.equal(attempts5xx, 2);
+    assert.equal(isRetryableGoogleError({ response: { status: 429 } }), true);
+    assert.equal(isRetryableGoogleError({ response: { status: 401 } }), false);
+
+    let invalidAttempts = 0;
+    await assert.rejects(
+      withGoogleRetries(
+        async () => {
+          invalidAttempts += 1;
+          const err = new Error('invalid_grant');
+          err.response = { data: { error: 'invalid_grant' }, status: 400 };
+          throw err;
+        },
+        { env: { GMAIL_API_MAX_RETRIES: '2' }, sleep: async () => {} }
+      )
+    );
+    assert.equal(invalidAttempts, 1);
+  });
+
+  it('disconnect during sync does not finish healthy with credentials', async () => {
+    const account = await createAccount('disconnect-race@prod-ready.gmail-test.example', 'disconnect-race');
+    const installed = adapter({
+      async getMessage(_client, messageId) {
+        await disconnectGmailAccount(account.id);
+        return buildGmailMessage({ id: messageId, plain: 'race' });
+      },
+    });
+    installed.__store.listPages = [{ messages: [{ id: 'race-1' }], nextPageToken: null }];
+    installed.__store.profileHistoryId = '40';
+    const result = await syncGmailAccount(account.id, loadEnv(VALID_ENV));
+    assert.equal(result.syncFailed, true);
+    const reloaded = await getPrisma().inboxAccount.findUnique({
+      where: { id: account.id },
+      include: { gmailCredential: true },
+    });
+    assert.equal(reloaded.isActive, false);
+    assert.equal(reloaded.gmailCredential, null);
+    assert.notEqual(reloaded.syncStatus, SYNC_STATUS.OK);
+  });
+
+  it('duplicate message ingestion remains idempotent', async () => {
+    const account = await createAccount('dupe@prod-ready.gmail-test.example', 'dupe-google');
+    await getPrisma().inboxItem.create({
+      data: {
+        inboxAccountId: account.id,
+        source: 'GMAIL',
+        externalId: 'dup-1',
+        senderIdentifier: 'x@y.com',
+        rawContent: 'old',
+        status: 'NEW',
+        receivedAt: new Date(),
+      },
+    });
+    const installed = adapter();
+    installed.__store.listPages = [{ messages: [{ id: 'dup-1' }], nextPageToken: null }];
+    installed.__store.profileHistoryId = '50';
+    const result = await syncGmailAccount(account.id, loadEnv(VALID_ENV));
+    assert.equal(result.ok, true);
+    assert.equal(result.created, 0);
+    assert.equal(result.skipped, 1);
+  });
+
+  it('does not write sensitive values to Gmail logs', async () => {
+    const account = await createAccount('logs@prod-ready.gmail-test.example', 'logs-google');
+    const installed = adapter({
+      async listMessages() {
+        const err = new Error('SecretSubjectXYZ access-token-value refresh-token-value');
+        err.response = { status: 503, data: { error: 'backendError' } };
+        throw err;
+      },
+    });
+    installed.__store.profileHistoryId = '60';
+
+    const logs = [];
+    const originalError = console.error;
+    console.error = (...args) => logs.push(args.map(String).join(' '));
+    try {
+      const result = await syncGmailAccount(account.id, loadEnv(VALID_ENV));
+      assert.equal(result.syncFailed, true);
+    } finally {
+      console.error = originalError;
+    }
+    assert.ok(logs.length > 0);
+    for (const line of logs) {
+      assertNoSecrets(line);
+      assert.equal(line.includes('SecretSubjectXYZ'), false);
+      assert.equal(line.includes('refresh-token-value'), false);
     }
   });
 });
